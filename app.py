@@ -15,9 +15,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from bet_signals import evaluate_prop, log_prop
+from bet_signals import delete_prop, evaluate_prop, log_prop, settle_prop_manual
 from db import DB_PATH, connect, init_db, recent_players, season_for_date
-from game_model import GameContext, evaluate_markets, log_game_evals, stale_warning
+from game_model import (GameContext, delete_game_bets, evaluate_markets, log_game_evals, settle_game_manual,
+                        stale_warning)
 from projection_model import PropContext, count_distribution
 from tracking import game_summary, prop_summary, recent_games, recent_props
 
@@ -368,7 +369,102 @@ with tab_game:
 # Results
 # ---------------------------------------------------------------------------
 
+def manual_settle_section():
+    """Enter outcomes by hand (or correct automatic ones). Runs before the summaries are
+    computed so they reflect a save immediately."""
+    def _done(msg):
+        # rerun so the dropdowns and summaries reflect the change; show the message after
+        st.session_state['settle_msg'] = msg
+        st.rerun()
+
+    st.markdown("#### ✍️ Settle or delete manually")
+    if 'settle_msg' in st.session_state:
+        st.success(st.session_state.pop('settle_msg'))
+    st.caption("Enter the result yourself instead of waiting for **Update data**, correct one, or delete an "
+               "entry. Automatic settling never overwrites a result you entered.")
+    show_all = st.checkbox("Include already-settled entries (to correct or delete them)", key="settle_all")
+    kind = st.radio("What", ["Prop", "Game"], horizontal=True, key="settle_kind", label_visibility="collapsed")
+    conn = db()
+    try:
+        if kind == "Prop":
+            q = ("SELECT id, game_date, player_name, stat, line, pick, actual, result FROM prop_log "
+                 + ("" if show_all else "WHERE result IS NULL ") + "ORDER BY game_date DESC, id DESC")
+            rows = {r[0]: r for r in conn.execute(q).fetchall()}
+            if not rows:
+                st.info("No unsettled props." if not show_all else "No logged props yet.")
+                return
+
+            def label(i):
+                _, d, name, stat, line, pick, actual, result = rows[i]
+                status = f"{result} (actual {actual:g})" if actual is not None else (result or "unsettled")
+                return f"{d} · {name} {stat} {line:g} · pick {pick} · {status}"
+
+            with st.form("settle_prop"):
+                pid = st.selectbox("Prop", options=list(rows), format_func=label)
+                c1, c2 = st.columns([1, 2])
+                actual = c1.number_input("Actual stat", min_value=0.0, value=None, step=1.0,
+                                         placeholder="e.g. 27")
+                action = c2.radio("Action", ["Use actual stat", "Didn't play (void)", "Clear result",
+                                             "Delete entry"], horizontal=True)
+                confirm = st.checkbox("Yes, delete it (only needed for Delete entry)")
+                if st.form_submit_button("Save", type="primary"):
+                    if action == "Delete entry":
+                        if not confirm:
+                            st.error("Tick “Yes, delete it” to confirm.")
+                        elif delete_prop(conn, pid):
+                            _done(f"Deleted: {rows[pid][2]} {rows[pid][3]} {rows[pid][4]:g} ({rows[pid][1]})")
+                    elif action == "Use actual stat" and actual is None:
+                        st.error("Enter the actual stat.")
+                    else:
+                        res = settle_prop_manual(conn, pid, actual=actual if action == "Use actual stat" else None,
+                                                 dnp=action == "Didn't play (void)")
+                        _done(f"Saved: {rows[pid][2]} {rows[pid][3]} {rows[pid][4]:g} → "
+                                   f"{res or 'unsettled'}")
+        else:
+            q = ("SELECT game_date, home, away, COUNT(*), SUM(result IS NULL), MAX(away_pts), MAX(home_pts) "
+                 "FROM game_log GROUP BY game_date, home, away "
+                 + ("" if show_all else "HAVING SUM(result IS NULL) > 0 ") + "ORDER BY game_date DESC")
+            games = {f"{r[0]}|{r[1]}|{r[2]}": r for r in conn.execute(q).fetchall()}
+            if not games:
+                st.info("No unsettled game bets." if not show_all else "No logged game bets yet.")
+                return
+
+            def glabel(k):
+                d, home, away, n, unsettled, ap, hp = games[k]
+                status = "unsettled" if unsettled else f"final {away} {ap} – {home} {hp}"
+                return f"{d} · {away} @ {home} · {n} market(s) · {status}"
+
+            with st.form("settle_game"):
+                key = st.selectbox("Game", options=list(games), format_func=glabel)
+                d, home, away = key.split("|")
+                c1, c2 = st.columns(2)
+                ap = c1.number_input(f"{away} (away) final points", min_value=0, value=None, step=1)
+                hp = c2.number_input(f"{home} (home) final points", min_value=0, value=None, step=1)
+                action = st.radio("Action", ["Save final score", "Delete this game's bets"], horizontal=True)
+                confirm = st.checkbox("Yes, delete them (only needed for Delete)")
+                if st.form_submit_button("Save", type="primary"):
+                    if action == "Delete this game's bets":
+                        if not confirm:
+                            st.error("Tick “Yes, delete them” to confirm.")
+                        else:
+                            n = delete_game_bets(conn, d, home, away)
+                            _done(f"Deleted {n} logged market(s) for {away} @ {home} ({d}).")
+                    elif ap is None or hp is None:
+                        st.error("Enter both scores.")
+                    else:
+                        try:
+                            n = settle_game_manual(conn, d, home, away, int(hp), int(ap))
+                            _done(f"Saved {away} {int(ap)} – {home} {int(hp)}: settled {n} market(s).")
+                        except ValueError as e:
+                            st.error(str(e))
+    finally:
+        conn.close()
+
+
 with tab_results:
+    summary_area = st.container()
+    st.divider()
+    manual_settle_section()
     conn = db()
     try:
         ps, gs = prop_summary(conn), game_summary(conn)
@@ -376,29 +472,31 @@ with tab_results:
     finally:
         conn.close()
 
-    st.caption("Bets settle automatically when you press **Update data** after the games are played. "
-               "A real edge takes a few hundred bets to show up — under ~100 the record is mostly luck.")
-    for label, s in (("Props", ps), ("Game lines", gs)):
-        st.markdown(f"#### {label}")
-        rec = s['record']
-        c = st.columns(5)
-        c[0].metric("Logged / settled", f"{s['logged']} / {s['settled']}")
-        if rec:
-            c[1].metric("Record (W-L-P)", f"{rec['wins']}-{rec['losses']}-{rec['pushes']}")
-            c[2].metric("Profit", f"{rec['profit']:+.2f} units")
-            c[3].metric("ROI", f"{rec['roi']:+.1%}")
-            c[4].metric("Avg EV claimed", f"{rec['claimed_ev']:+.1%}")
-        else:
-            c[1].metric("Record (W-L-P)", "—")
-        cal = s.get('calibration')
-        if cal:
-            better = cal['brier_model'] < cal['brier_market']
-            st.markdown(f"Model vs market on **{cal['n']}** settled props (lower Brier score = better forecaster): "
-                        f"model **{cal['brier_model']:.4f}**, market **{cal['brier_market']:.4f}** → "
-                        f"{'✅ model better' if better else '❌ market better'}"
-                        + (" *(too few to mean much yet)*" if cal['n'] < 100 else ""))
+    with summary_area:
+        st.caption("Bets settle automatically when you press **Update data** after the games are played, "
+                   "or enter results yourself below. A real edge takes a few hundred bets to show up — "
+                   "under ~100 the record is mostly luck.")
+        for label, s in (("Props", ps), ("Game lines", gs)):
+            st.markdown(f"#### {label}")
+            rec = s['record']
+            c = st.columns(5)
+            c[0].metric("Logged / settled", f"{s['logged']} / {s['settled']}")
+            if rec:
+                c[1].metric("Record (W-L-P)", f"{rec['wins']}-{rec['losses']}-{rec['pushes']}")
+                c[2].metric("Profit", f"{rec['profit']:+.2f} units")
+                c[3].metric("ROI", f"{rec['roi']:+.1%}")
+                c[4].metric("Avg EV claimed", f"{rec['claimed_ev']:+.1%}")
+            else:
+                c[1].metric("Record (W-L-P)", "—")
+            cal = s.get('calibration')
+            if cal:
+                better = cal['brier_model'] < cal['brier_market']
+                st.markdown(f"Model vs market on **{cal['n']}** settled props (lower Brier score = better "
+                            f"forecaster): model **{cal['brier_model']:.4f}**, market "
+                            f"**{cal['brier_market']:.4f}** → {'✅ model better' if better else '❌ market better'}"
+                            + (" *(too few to mean much yet)*" if cal['n'] < 100 else ""))
 
-    st.markdown("#### Logged props")
-    st.dataframe(props_df, hide_index=True, width="stretch")
-    st.markdown("#### Logged game lines")
-    st.dataframe(games_df, hide_index=True, width="stretch")
+        st.markdown("#### Logged props")
+        st.dataframe(props_df, hide_index=True, width="stretch")
+        st.markdown("#### Logged game lines")
+        st.dataframe(games_df, hide_index=True, width="stretch")

@@ -351,8 +351,30 @@ def log_game_evals(conn, game_date, pred, evals, book=None):
     conn.commit()
 
 
+def game_result(market, line, pick, home_pts, away_pts, home, away):
+    """'WIN' | 'LOSS' | 'PUSH' for a bet, or 'PASS (<side that won>)' for a pass."""
+    if market == 'SPREAD':
+        v = home_pts - away_pts + line
+    elif market == 'TOTAL':
+        v = home_pts + away_pts - line
+    else:
+        v = home_pts - away_pts
+    side = 'A' if v > 0 else 'B' if v < 0 else 'PUSH'
+    if pick == 'PASS':
+        names = {'A': 'OVER' if market == 'TOTAL' else home, 'B': 'UNDER' if market == 'TOTAL' else away,
+                 'PUSH': 'PUSH'}
+        return f'PASS ({names[side]})'
+    return 'PUSH' if side == 'PUSH' else 'WIN' if side == pick else 'LOSS'
+
+
+def _write_game_result(conn, row_id, market, line, pick, hp, ap, home, away, now):
+    conn.execute("UPDATE game_log SET home_pts=?, away_pts=?, result=?, settled_at=? WHERE id=?",
+                 (hp, ap, game_result(market, line, pick, hp, ap, home, away), now, row_id))
+
+
 def settle_games(conn):
-    """Fill results for logged game bets whose games are now in team_games."""
+    """Fill results for logged game bets whose games are now in team_games.
+    Only unsettled rows are touched, so manual results are never overwritten."""
     rows = conn.execute("SELECT id, game_date, home, away, market, line, pick FROM game_log "
                         "WHERE result IS NULL").fetchall()
     n = 0
@@ -364,22 +386,31 @@ def settle_games(conn):
                          (home, away, d)).fetchone()
         if not r:
             continue
-        hp, ap = r
-        if market == 'SPREAD':
-            v = hp - ap + line
-            side = 'A' if v > 0 else 'B' if v < 0 else 'PUSH'
-        elif market == 'TOTAL':
-            v = hp + ap - line
-            side = 'A' if v > 0 else 'B' if v < 0 else 'PUSH'
-        else:
-            side = 'A' if hp > ap else 'B'
-        if pick == 'PASS':
-            result = f'PASS ({side})'
-        else:
-            result = 'PUSH' if side == 'PUSH' else 'WIN' if side == pick else 'LOSS'
-        conn.execute("UPDATE game_log SET home_pts=?, away_pts=?, result=?, settled_at=? WHERE id=?",
-                     (hp, ap, result, now, gid))
+        _write_game_result(conn, gid, market, line, pick, r[0], r[1], home, away, now)
         n += 1
+    conn.commit()
+    return n
+
+
+def settle_game_manual(conn, game_date, home, away, home_pts, away_pts):
+    """Enter a final score by hand: settles (or corrects) every logged market for that game."""
+    if home_pts < 0 or away_pts < 0:
+        raise ValueError("Scores can't be negative")
+    if home_pts == away_pts:
+        raise ValueError("NBA games can't end tied — enter the final score including overtime")
+    rows = conn.execute("SELECT id, market, line, pick FROM game_log WHERE game_date=? AND home=? AND away=?",
+                        (game_date, home, away)).fetchall()
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    for row_id, market, line, pick in rows:
+        _write_game_result(conn, row_id, market, line, pick, int(home_pts), int(away_pts), home, away, now)
+    conn.commit()
+    return len(rows)
+
+
+def delete_game_bets(conn, game_date, home, away):
+    """Remove every logged market for one game. Returns the number of rows deleted."""
+    n = conn.execute("DELETE FROM game_log WHERE game_date=? AND home=? AND away=?",
+                     (game_date, home, away)).rowcount
     conn.commit()
     return n
 

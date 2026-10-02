@@ -1,3 +1,5 @@
+import pytest
+
 from bet_signals import evaluate_prop, log_prop, report, settle_props
 from game_model import GameContext, evaluate_markets, log_game_evals, settle_games
 from projection_model import PropContext
@@ -81,3 +83,44 @@ def test_neutral_site_game_settles(league_conn):
     log_game_evals(league_conn, d, pred, evaluate_markets(pred, total=200.5, total_odds=(-110, -110),
                                                          min_ev=-1.0))
     assert settle_games(league_conn) == 1
+
+
+def test_manual_prop_settle_correct_void_clear_delete(league_conn):
+    from bet_signals import delete_prop, settle_prop_manual
+    d, home, away = _game(league_conn)
+    pid = league_conn.execute("SELECT player_id FROM player_games WHERE game_date=? AND team=? "
+                              "ORDER BY minutes DESC", (d, home)).fetchone()[0]
+    r = evaluate_prop(PropContext(league_conn, d), pid, 'PTS', 20.5, -110, -110, min_ev=-1.0)
+    log_prop(league_conn, r)
+    row_id = league_conn.execute("SELECT id FROM prop_log").fetchone()[0]
+    pick = r['pick']
+    win_val, lose_val = (25, 15) if pick == 'OVER' else (15, 25)
+    assert settle_prop_manual(league_conn, row_id, actual=win_val) == 'WIN'
+    assert settle_prop_manual(league_conn, row_id, actual=lose_val) == 'LOSS'     # correction
+    # automatic settling never overwrites a manual result
+    settle_props(league_conn)
+    assert league_conn.execute("SELECT actual FROM prop_log").fetchone()[0] == lose_val
+    assert settle_prop_manual(league_conn, row_id, dnp=True) == 'DNP'
+    assert settle_prop_manual(league_conn, row_id) is None                        # clear
+    assert league_conn.execute("SELECT result FROM prop_log").fetchone()[0] is None
+    assert delete_prop(league_conn, row_id)
+    assert league_conn.execute("SELECT COUNT(*) FROM prop_log").fetchone()[0] == 0
+    assert not delete_prop(league_conn, row_id)
+
+
+def test_manual_game_settle_and_delete(league_conn):
+    from game_model import delete_game_bets, settle_game_manual
+    d, home, away = _game(league_conn)
+    pred = GameContext(league_conn, d).evaluate(home, away, spread=-3.5, total=220.5)
+    evals = evaluate_markets(pred, -3.5, (-110, -110), 220.5, (-110, -110), (-150, 130), min_ev=-1.0)
+    log_game_evals(league_conn, d, pred, evals)
+    assert settle_game_manual(league_conn, d, home, away, 115, 108) == 3
+    res = dict(league_conn.execute("SELECT market, result FROM game_log").fetchall())
+    picks = dict(league_conn.execute("SELECT market, pick FROM game_log").fetchall())
+    # home won by 7: covers -3.5 (A), total 223 > 220.5 (A), moneyline home (A)
+    for m in ('SPREAD', 'TOTAL', 'MONEYLINE'):
+        assert res[m] == ('WIN' if picks[m] == 'A' else 'LOSS')
+    with pytest.raises(ValueError):
+        settle_game_manual(league_conn, d, home, away, 100, 100)
+    assert delete_game_bets(league_conn, d, home, away) == 3
+    assert league_conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0

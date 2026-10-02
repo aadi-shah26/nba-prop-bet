@@ -106,9 +106,18 @@ def log_prop(conn, r, book=None):
     conn.commit()
 
 
+def prop_result(actual, line, pick):
+    """'WIN' | 'LOSS' | 'PUSH' for a bet, or 'PASS (OVER|UNDER|PUSH)' for a pass."""
+    side = 'OVER' if actual > line else 'UNDER' if actual < line else 'PUSH'
+    if pick == 'PASS':
+        return f'PASS ({side})'
+    return 'PUSH' if side == 'PUSH' else 'WIN' if side == pick else 'LOSS'
+
+
 def settle_props(conn):
     """Fill actual results for logged props whose games are now in player_games.
-    A player with no row once that date's games are loaded = DNP (books void these)."""
+    A player with no row once that date's games are loaded = DNP (books void these).
+    Only unsettled props are touched, so manual results are never overwritten."""
     latest = conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
     rows = conn.execute("SELECT id, game_date, player_id, stat, line, pick FROM prop_log "
                         "WHERE result IS NULL").fetchall()
@@ -124,16 +133,41 @@ def settle_props(conn):
                 n += 1
             continue
         actual = float(g[0])
-        side = 'OVER' if actual > line else 'UNDER' if actual < line else 'PUSH'
-        if pick == 'PASS':
-            result = f'PASS ({side})'
-        else:
-            result = 'PUSH' if side == 'PUSH' else 'WIN' if side == pick else 'LOSS'
         conn.execute("UPDATE prop_log SET actual=?, result=?, settled_at=? WHERE id=?",
-                     (actual, result, now, pid_row))
+                     (actual, prop_result(actual, line, pick), now, pid_row))
         n += 1
     conn.commit()
     return n
+
+
+def settle_prop_manual(conn, prop_id, actual=None, dnp=False):
+    """Record a prop's outcome by hand (or correct one). actual=None with dnp=True voids it;
+    actual=None with dnp=False clears the result so it's unsettled again."""
+    row = conn.execute("SELECT line, pick FROM prop_log WHERE id = ?", (prop_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"No logged prop with id {prop_id}")
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    if dnp:
+        conn.execute("UPDATE prop_log SET actual=NULL, result='DNP', settled_at=? WHERE id=?", (now, prop_id))
+        result = 'DNP'
+    elif actual is None:
+        conn.execute("UPDATE prop_log SET actual=NULL, result=NULL, settled_at=NULL WHERE id=?", (prop_id,))
+        result = None
+    else:
+        if actual < 0:
+            raise ValueError("Actual stat can't be negative")
+        result = prop_result(float(actual), row[0], row[1])
+        conn.execute("UPDATE prop_log SET actual=?, result=?, settled_at=? WHERE id=?",
+                     (float(actual), result, now, prop_id))
+    conn.commit()
+    return result
+
+
+def delete_prop(conn, prop_id):
+    """Remove a logged prop entirely. Returns True if a row was deleted."""
+    n = conn.execute("DELETE FROM prop_log WHERE id = ?", (prop_id,)).rowcount
+    conn.commit()
+    return n > 0
 
 
 def report(conn):

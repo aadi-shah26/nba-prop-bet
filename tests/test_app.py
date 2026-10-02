@@ -88,3 +88,38 @@ def test_empty_database_prompt(tmp_path, monkeypatch):
     at = st_testing.AppTest.from_file(APP, default_timeout=60).run()
     assert not at.exception
     assert any('Update data' in i.value for i in at.info)
+
+
+def test_manual_settle_and_delete_in_app(app_db):
+    from bet_signals import evaluate_prop, log_prop
+    from projection_model import PropContext
+    d, home, away = _game_date(app_db)
+    pid = app_db.execute("SELECT player_id FROM player_games WHERE team=? ORDER BY minutes DESC",
+                         (home,)).fetchone()[0]
+    r = evaluate_prop(PropContext(app_db, d), pid, 'PTS', 20.5, -110, -110, min_ev=-1.0)
+    log_prop(app_db, r)
+    row_id = app_db.execute("SELECT id FROM prop_log").fetchone()[0]
+
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    _w(at.number_input, 'Actual stat').set_value(40.0)
+    _w(at.button, 'Save').click()
+    at.run()
+    assert not at.exception
+    assert app_db.execute("SELECT actual, result FROM prop_log").fetchone() == \
+        (40.0, 'WIN' if r['pick'] == 'OVER' else 'LOSS')
+    assert any('Saved' in s.value for s in at.success)
+
+    # settled entries are hidden unless the box is ticked; then delete needs confirmation
+    _w(at.checkbox, 'Include already-settled entries (to correct or delete them)').check()
+    at.run()
+    _w(at.radio, 'Action').set_value('Delete entry')
+    _w(at.button, 'Save').click()
+    at.run()
+    assert any('confirm' in e.value for e in at.error)
+    assert app_db.execute("SELECT COUNT(*) FROM prop_log").fetchone()[0] == 1
+    _w(at.radio, 'Action').set_value('Delete entry')
+    _w(at.checkbox, 'Yes, delete it (only needed for Delete entry)').check()
+    _w(at.button, 'Save').click()
+    at.run()
+    assert not at.exception
+    assert app_db.execute("SELECT COUNT(*) FROM prop_log WHERE id=?", (row_id,)).fetchone()[0] == 0
