@@ -137,12 +137,12 @@ def reliability(df, bins=(0, .2, .3, .4, .45, .5, .55, .6, .7, .8, 1.0)):
 
 
 TUNE_GRID = {
-    'half_life_minutes': [5, 8, 12],
+    'half_life_minutes': [3, 5, 8],
     'half_life_rate': [15, 25, 40],
     'prev_season_weight': [0.4, 0.6, 0.8],
     'opp_strength': [0.0, 0.5, 1.0],
-    'disp_prior_games': [10, 20, 40],
-    'var_scale': [1.0, 1.15, 1.3],
+    'disp_prior_games': [5, 10, 20],
+    'var_scale': [1.15, 1.3, 1.45],
 }
 
 _W = {}

@@ -60,14 +60,15 @@ def parse_stat(s):
 
 @dataclass
 class PropParams:
-    half_life_minutes: float = 8.0     # games; minutes react quickly to role changes
+    # Defaults tuned walk-forward on 2022-23 (mean log-likelihood), checked on 2021-22 and 2023-24.
+    half_life_minutes: float = 3.0     # games; minutes react quickly to role changes
     half_life_rate: float = 25.0       # games; per-minute production is more stable
     prev_season_weight: float = 0.6    # extra multiplier per season back
     lookback_seasons: int = 2          # current + previous season
     max_games: int = 160               # older games have negligible weight anyway
     rate_prior_minutes: float = 60.0   # pseudo-minutes of league-average production
-    disp_prior_games: float = 20.0     # pseudo-games of league over-dispersion
-    var_scale: float = 1.0             # multiplier on over-dispersion (calibration)
+    disp_prior_games: float = 10.0     # pseudo-games of league over-dispersion
+    var_scale: float = 1.3             # multiplier on over-dispersion (calibration)
     opp_half_life: float = 30.0        # games (per team)
     opp_prior_games: float = 15.0      # pseudo-games of league average for opponent factors
     opp_strength: float = 1.0          # exponent on opponent factor (0 = ignore opponent)

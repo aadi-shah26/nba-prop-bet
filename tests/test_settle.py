@@ -61,3 +61,13 @@ def test_game_settlement(league_conn):
     assert res['SPREAD'] == 'PUSH' and res['TOTAL'] == 'PUSH'
     ml_pick = league_conn.execute("SELECT pick FROM game_log WHERE market='MONEYLINE'").fetchone()[0]
     assert res['MONEYLINE'] == ('WIN' if (ml_pick == 'A') == (hp > ap) else 'LOSS')
+
+
+def test_game_log_dedup_without_book(league_conn):
+    d, home, away = _game(league_conn)
+    ctx = GameContext(league_conn, d)
+    pred = ctx.evaluate(home, away, spread=-2.5)
+    evals = evaluate_markets(pred, -2.5, (-110, -110))
+    log_game_evals(league_conn, d, pred, evals)
+    log_game_evals(league_conn, d, pred, evals)
+    assert league_conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 1

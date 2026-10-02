@@ -1,427 +1,173 @@
-# 🏀 NBA Prop Betting Bot
+# 🏀 NBA Prop & Game Model
 
-Automated NBA player prop betting bot that generates actionable bets using live odds and ML projections.
+Pulls every NBA player and team box score for the last 3 seasons, projects any player stat as a
+full probability distribution, and tells you whether a line you enter is an **OVER, UNDER or
+PASS** — with real expected value against the bookmaker's no-vig price. A team-rating model
+does the same for **spreads, totals and moneylines**. Every evaluation is logged and settled
+automatically, so you can measure whether the model actually beats the market.
 
-## Features
+No paid data is required. The Odds API is optional (free tier covers game lines and a few
+prop markets per day).
 
-- ✅ Fetches live player props from The Odds API (DraftKings, FanDuel, etc.)
-- ✅ Generates projections using historical game logs (9,320+ games)
-- ✅ Calculates Expected Value (EV) for each prop
-- ✅ Automatically identifies profitable bets
-- ✅ Outputs daily bet recommendations to CSV
-- ✅ Supports all stat types: PTS, AST, REB, PA, PR, AR, PRA
-- ✅ 94 NBA players tracked with daily updates
-
-## Quick Start
-
-### Installation
+## Setup
 
 ```bash
-# Clone the repo
-git clone https://github.com/aadi113467-gif/nba-prop-bet.git
-cd nba-prop-bet
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Create .env file with your API key
-echo "ODDS_API_KEY=your_key_here" > .env
+python fetch_game_logs.py          # one-time: last 3 seasons, ~6 requests to stats.nba.com
+python daily_update.py             # every day: refresh, settle logged bets, recalibrate
 ```
 
-### Get API Key
+Optional, for live lines: put `ODDS_API_KEY=...` in a `.env` file.
 
-1. Go to https://the-odds-api.com
-2. Sign up for free account
-3. Copy your API key
-4. Add to `.env`: `ODDS_API_KEY=abc123xyz...`
+The database (`nba_data.db`) is not committed — `fetch_game_logs.py` rebuilds it in about a
+minute.
 
-**Note:** Free tier includes mock data for testing. Upgrade for live sportsbook props.
+## Daily use
 
----
-
-## Interactive Testing
-
-### Test Projections (Any Player, Any Stat, Any Line)
+### Props — you enter the line
 
 ```bash
-python3 projection_model.py interactive
+python bet_signals.py                                         # interactive
+python bet_signals.py "shai" PTS 31.5 --over -115 --under -105 --opp LAL
+python bet_signals.py "jokic" PRA 52.5 --opp MIN --minutes 30   # known minutes limit
 ```
 
-**Example 1: Points Projection**
 ```
-Enter player name (or 'quit' to exit): shai
-✅ Found: Shai Gilgeous-Alexander
-
-Enter stat type (PTS/AST/REB/PRA/PA/PR/AR): pts
-Enter line: 30.5
-Enter opponent (3-letter code, or press Enter for none): lal
-
-======================================================================
-🎯 PROJECTION: Shai Gilgeous-Alexander (2025)
-======================================================================
-Line:                    30.5 pts
-Projection:              32.14 pts
-Edge:                    +1.64 pts
-Z-Score:                 -0.30
-Lean:                    OVER
-
-📊 Component Averages:
-  Season Avg:            31.45 PPG
-  Last 10 Avg:           33.21 PPG
-  Opponent-Adjusted Avg: 32.58 PPG
-======================================================================
+🎯 Shai Gilgeous-Alexander (OKC) PTS 31.5 vs LAL   [2024-03-01]
+Projection:   30.92 ± 7.78    fair line 30.5    minutes 34.2
+          odds    model   market       EV
+OVER      -115    44.5%    51.1%   -16.7%
+UNDER     -105    55.5%    48.9%    +8.3%
+➜ BET UNDER   ¼-Kelly stake: 2.2% of bankroll
 ```
 
-**Example 2: Assists Projection**
-```
-Enter player name: lebron
-✅ Found: LeBron James
+* **model** — probability from the player's projected distribution (pushes handled exactly on whole-number lines)
+* **market** — the book's probability with its margin removed (needs both prices; default -110/-110)
+* **EV** — expected profit per $1 at the offered price
+* Bets only when EV ≥ +3% (`--min-ev`). Warnings flag likely missing information (big
+  model/market disagreement, stale data, small samples, low-minute players).
 
-Enter stat type: ast
-Enter line: 7.5
-Enter opponent: (press Enter for none)
+Stats: `PTS REB AST STL BLK TOV FG3M PRA PR PA RA SB` (aliases like `3PM`, `P+R+A` work).
 
-======================================================================
-🎯 PROJECTION: LeBron James (2025)
-======================================================================
-Line:                    7.5 ast
-Projection:              8.23 ast
-Edge:                    +0.73 ast
-Z-Score:                 0.33
-Lean:                    OVER
-======================================================================
-```
-
-**Example 3: Combo Stats (PRA)**
-```
-Enter player name: stephen curry
-✅ Found: Stephen Curry
-
-Enter stat type: pra
-Enter line: 50.5
-Enter opponent: gsw
-
-======================================================================
-🎯 PROJECTION: Stephen Curry (2025)
-======================================================================
-Line:                    50.5 pra
-Projection:              52.30 pra
-Edge:                    +1.80 pra
-Z-Score:                 0.23
-Lean:                    OVER
-======================================================================
-```
-
----
-
-### Test Bet Signals (With Odds & EV Calculation)
+### What should the line be?
 
 ```bash
-python3 bet_signals.py interactive
+python projection_model.py "shai" PTS --opp LAL     # projection, fair line, P(over) ladder
 ```
 
-**Example 1: High EV Bet**
-```
-Enter player name (or 'quit'): jalen johnson
-✅ Found: Jalen Johnson
-
-Enter stat type (PTS/AST/REB/PRA/PA/PR/AR): reb
-Enter line: 8.5
-Enter American odds (e.g., -110): -110
-Enter opponent (optional, press Enter for none): (press Enter)
-
-================================================================================
-✅ BET OVER
-================================================================================
-Player:              Jalen Johnson
-Line:                8.5 reb @ -110 odds
-
-📊 Projection Analysis:
-  Projection:        9.58 reb
-  Edge:              +1.08 reb
-  Z-Score:           0.39
-  Lean:              OVER
-
-💰 Probability & EV:
-  Sportsbook Prob:   52.38%
-  Model Prob:        67.39%
-  Expected Value:    +15.01%
-
-💡 Reasoning:
-  Positive edge + positive EV (15.01%)
-================================================================================
-```
-
-**Example 2: No Bet (Negative EV)**
-```
-Enter player name: lebron james
-✅ Found: LeBron James
-
-Enter stat type: pts
-Enter line: 24.5
-Enter odds: -110
-Enter opponent: gsw
-
-================================================================================
-⭕ NO BET
-================================================================================
-Player:              LeBron James
-Line:                24.5 pts @ -110 odds
-
-📊 Projection Analysis:
-  Projection:        20.15 pts
-  Edge:              -4.35 pts
-  Z-Score:           -0.79
-  Lean:              UNDER
-
-💰 Probability & EV:
-  Sportsbook Prob:   52.38%
-  Model Prob:        38.21%
-  Expected Value:    -14.17%
-
-💡 Reasoning:
-  Negative edge + negative EV (-14.17%)
-================================================================================
-```
-
----
-
-## Automated Daily Bets
-
-### Generate All Bets (Single Run)
+### Games — score prediction, spreads, totals
 
 ```bash
-python3 generate_daily_bets.py
+python game_model.py --home BOS --away LAL                          # predicted score + win prob
+python game_model.py --home BOS --away LAL --spread -5.5 --total 221.5 --ml -230 +190
+python game_model.py --slate                                        # today's games, Odds API lines (3 credits)
 ```
 
-**Output:**
-```
-================================================================================
-🎯 DAILY BET GENERATION PIPELINE
-================================================================================
+`--spread` is always the **home** team's line.
 
-📅 Season: 2025
-⏰ Timestamp: 2026-04-12T15:30:45.123456
-
-[1/4] Fetching props from The Odds API...
-✅ Found 150 total props
-
-[2/4] Matching players and generating signals...
-  ✓ Processed 20/150 props...
-  ✓ Processed 40/150 props...
-✅ Generated signals for 135 props
-
-[3/4] Filtering to actionable bets...
-✅ Found 12 actionable bets (EV > 3%)
-
-[4/4] Outputting results to CSV...
-✅ Saved to: daily_bets/bets_2026-04-12.csv
-
-================================================================================
-📊 SUMMARY
-================================================================================
-Total props fetched:        150
-Matched to database:        135
-Actionable bets (EV > 3%):  12
-Average EV:                 5.47%
-
-🎯 Top 3 Bets:
-   1. Shai Gilgeous-Alexander   PTS 30.5 @ -110   | EV:    7.23%
-   2. Jalen Johnson             REB  8.5 @ -110   | EV:    6.15%
-   3. LeBron James              PTS 25.5 @ -110   | EV:    4.82%
-
-✅ Completed at 2026-04-12T15:30:47.654321
-```
-
-### Automate with Cron (Mac/Linux)
-
-Run daily at 6 PM (before games):
+### Automated props from The Odds API
 
 ```bash
-crontab -e
+python generate_daily_bets.py                                       # player_points, all US books
+python generate_daily_bets.py --markets player_points player_rebounds --max-events 3
 ```
 
-Add this line:
+Props cost **1 credit per market per game** (all US books are included in that, so the best
+price across books is found for free). A 10-game night with one market ≈ 10 credits. Output
+goes to `daily_bets/props_<date>.csv` and the log.
+
+### How am I doing?
+
 ```bash
-0 18 * * * cd /Users/aadishah/nba-prop-bet && python3 generate_daily_bets.py >> logs/daily_bets.log 2>&1
+python bet_signals.py --report
 ```
 
-Check logs:
+Record, ROI and — most importantly — whether the model's probabilities beat the market's
+no-vig probabilities (Brier score) on everything you've logged. **This is the only real test of
+edge**; the backtest below can't use historical lines because none are freely available.
+
+## How the models work
+
+**Props** (`feature_engineering.py`, `projection_model.py`), using only games before the game date:
+
+* projected minutes = recency-weighted recent minutes (half-life 5 games)
+* per-minute rate for each component stat (half-life 25 games, last season down-weighted)
+* opponent factor per component = what the opponent allows vs league average, shrunk toward 1
+* mean = Σ minutes × rate × opponent factor (combos like PRA are built from components)
+* variance = mean + α·mean² — the player's own over-dispersion, shrunk to the league value
+* outcome distribution = negative binomial → exact P(over), P(under), P(push)
+
+**Games** (`game_model.py`): possessions, offensive/defensive points per 100 and pace for each
+team, recency-weighted, opponent-adjusted (SRS-style) and shrunk to league average.
+Margin uses slower ratings (half-life 20 games), totals faster ones (10 games) — tuned
+walk-forward. Home court is estimated from the data. Margin/total are discretized normals
+whose SDs `daily_update.py` recalibrates from recent residuals.
+
+## Backtest
+
 ```bash
-tail -f logs/daily_bets.log
+python backtest.py props --seasons 2025
+python backtest.py props --tune 2024 --seasons 2025       # tune on one season, report on another
+python backtest.py games --seasons 2024 2025
 ```
 
----
+Walk-forward: every prediction uses only earlier games. Results on 2023-24 (parameters tuned
+on 2022-23, so this season was never used for fitting):
 
-## Project Structure
+**Props, 2023-24** (8,064 player-games per stat; walk-forward, 10 teams' players in the test data):
 
-```
-nba-prop-bet/
-├── .env                          # API keys (git-ignored)
-├── .gitignore                    # Git ignore rules
-├── README.md                     # This file
-├── requirements.txt              # Python dependencies
-├── nba_data.db                   # Game logs database (9,320+ games)
-│
-├── Core Pipeline
-├── fetch_game_logs.py            # NBA data collection & updates
-├── feature_engineering.py        # Feature calculations (avg, last 10, etc)
-├── projection_model.py           # ML projection model for all stats
-├── bet_signals.py                # EV calculation & bet signals
-│
-├── API Integration
-├── odds_fetcher.py               # Fetch props from The Odds API
-├── generate_daily_bets.py        # Main automation pipeline
-│
-└── Outputs
-    └── daily_bets/               # CSV files with daily bets
-        └── bets_2026-04-12.csv   # Example: April 12 bets
-```
+| Stat | MAE model | season avg | last-10 | old 50/30/20* | Brier model | Brier old* | 80% interval hit |
+|---|---|---|---|---|---|---|---|
+| PTS  | **4.54** | 4.61 | 4.63 | 4.56 | **0.244** | 0.247 | 78.3% |
+| REB  | **1.85** | 1.89 | 1.89 | 1.87 | **0.239** | 0.245 | 79.8% |
+| AST  | **1.35** | 1.38 | 1.38 | 1.36 | **0.236** | 0.243 | 79.2% |
+| 3PM  | 0.870 | 0.868 | 0.885 | 0.869 | **0.215** | 0.244 | 80.0% |
+| PRA  | **6.01** | 6.17 | 6.13 | 6.06 | **0.241** | 0.244 | 80.4% |
 
----
+2021-22 (also never used for tuning) looks the same: PTS MAE 4.56 vs 4.68 season average, 80% interval hit
+80.0%; Brier is a tie with the old formula on PTS/PRA.
+\* "old" = this repo's previous 50/30/20 formula and fixed SDs **with its date-sorting bug fixed** —
+the code as it was used October games as "last 10", so it was considerably worse than shown.
 
-## Supported Stats
+Brier scores are for P(over) at a proxy line (season-to-date average rounded to x.5); 0.250 is a
+coin flip. Calibration by bucket is close (e.g. predicted 0.474 → actual 0.487; 0.635 → 0.649),
+with a slight under-projection of assists/PRA (−0.1 per game).
 
-| Stat | Abbreviation | Database Column | Volatility |
-|------|--------------|-----------------|-----------|
-| Points | PTS | points | Medium (σ=5.5) |
-| Assists | AST | ast | Low (σ=2.2) |
-| Rebounds | REB | reb | Low-Med (σ=2.8) |
-| Pts+Ast | PA | calculated | High (σ=6.5) |
-| Pts+Reb | PR | calculated | High (σ=7.0) |
-| Ast+Reb | AR | calculated | Med (σ=3.5) |
-| PRA | PRA | calculated | High (σ=8.0) |
+**Games, 2021-22 to 2023-24** (3,943 games):
 
----
+| | Model | Season-average baseline |
+|---|---|---|
+| Margin MAE | **10.88** | 11.27 |
+| Total MAE | **14.68** | 15.24 |
+| Winner picked | 64.7% | |
 
-## Database Stats
+Win probabilities are reasonably calibrated but slightly timid (predicted 71% → won 75%;
+predicted 43% → won 40%). For reference, closing Vegas lines pick roughly 67-69% of winners
+(estimate) — the market is still better than this model on sides.
 
-- **Players Tracked:** 94 NBA stars
-- **Game Logs:** 9,320+ games from 2024-2025 seasons
-- **Last Updated:** Daily via [`daily_update.py`](daily_update.py)
-- **Date Range:** October 2024 - April 2026
-- **Updated Automatically:** Yes (cron job)
+**Honest read:** the projections are modestly better than simple averages and the
+probabilities are well calibrated, which is a prerequisite for finding edges — not proof of
+one. Books see injury news, rotations and sharp money; this model doesn't. Treat large
+model/market gaps as "check the news", not "free money", and let `--report` on a few hundred
+logged props tell you whether it beats the closing market.
 
----
+**Known blind spots:** injuries and teammates' absences (use `--minutes`), late-season tanking
+and rest (projections lag sudden role changes — April is the weakest month), trades
+(opponent/team inferred from the player's latest team in the data).
 
-## Performance
+## Files
 
-Example results from backtesting:
-
-```
-Total Props Analyzed:  1,200+
-Actionable Bets Found:    72
-Average EV:            +5.2%
-Win Rate (simulated):  56.3%
-ROI (if betting $100/bet): +$376
-```
-
-*Note: Past performance doesn't guarantee future results. Always bet responsibly.*
-
----
-
-## Bet Signal Thresholds
-
-Current settings in [`bet_signals.py`](bet_signals.py):
-
-```python
-min_ev = 0.03        # Only bet if EV > 3%
-min_edge = 0.5       # Only bet if edge > 0.5 pts
-std_dev = 5.5        # Points volatility (adjust per stat)
-```
-
-Adjust these in the code to be more/less aggressive:
-- ↓ Thresholds = More bets, lower confidence
-- ↑ Thresholds = Fewer bets, higher confidence
-
----
-
-## Troubleshooting
-
-### "Player not found"
-```bash
-# Check available players
-python3 projection_model.py interactive
-# Type: lebron (case-insensitive, partial names work)
-```
-
-### ".env not found"
-```bash
-# Create .env file
-echo "ODDS_API_KEY=your_key_here" > .env
-```
-
-### "No actionable bets found"
-- Odds API might be returning mock data (free tier)
-- Try upgrading to paid plan for live props
-- Or lower EV threshold in [`generate_daily_bets.py`](generate_daily_bets.py)
-
-### Database issues
-```bash
-# Update database with latest games
-python3 daily_update.py
-
-# Check database
-sqlite3 nba_data.db "SELECT COUNT(*) FROM game_logs;"
-```
-
----
-
-## API Limits
-
-**Free Tier (The Odds API):**
-- 500 requests/month
-- Mock data for testing
-- Good for development
-
-**Paid Tier ($25-100/month):**
-- Live sportsbook props
-- Higher request limits
-- All stat types
-
-Upgrade at: https://the-odds-api.com
-
----
-
-## Next Steps
-
-1. ✅ Get API key from The Odds API
-2. ✅ Add to `.env` file
-3. ✅ Test interactive modes
-4. ✅ Run `generate_daily_bets.py`
-5. ✅ Set up cron job for daily automation
-6. ✅ Start receiving daily bet recommendations!
-
----
-
-## Betting Responsibly
-
-- 🎯 Start small ($10-25 per bet)
-- 📊 Track all bets in a spreadsheet
-- 💰 Never bet more than you can afford to lose
-- 📈 Monitor your ROI over time
-- ⚠️ This bot is NOT financial advice
-
----
-
-## License
-
-MIT License - see LICENSE file
-
----
-
-## Support
-
-Questions? Found a bug?
-
-1. Check the troubleshooting section above
-2. Review the code comments
-3. Open an issue on GitHub
-
----
-
-## Author
-
-Created by: aadi113467-gif
-
-Last Updated: April 2026
+| File | Purpose |
+|---|---|
+| `fetch_game_logs.py` | League-wide player + team game logs from stats.nba.com |
+| `daily_update.py` | Refresh current season, settle logged bets, recalibrate game model |
+| `feature_engineering.py` | Shared numeric core (rates, minutes, opponent factors, dispersion) |
+| `projection_model.py` | Distributions, fair lines, projection CLI |
+| `bet_signals.py` | Prop evaluator, prop log, settlement, report |
+| `game_model.py` | Team ratings, score/spread/total/moneyline model |
+| `odds.py` | American odds, no-vig, EV, Kelly |
+| `odds_fetcher.py` | The Odds API client (props via per-event endpoint, game lines) |
+| `generate_daily_bets.py` | Automated prop slate from The Odds API |
+| `backtest.py` | Walk-forward backtests and parameter tuning |
+| `db.py`, `schema.sql` | Database, season helpers, player/team name matching |
+| `tests/` | `python -m pytest tests` |

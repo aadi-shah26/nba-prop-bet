@@ -333,7 +333,7 @@ def log_game_evals(conn, game_date, pred, evals, book=None):
                         odds_a, odds_b, book, pred_home, pred_away, p_a, p_b, fair_a, ev_a, ev_b, pick)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                      (now, game_date, pred['home'], pred['away'], e['market'], e['line'],
-                      int(e['odds_a']), int(e['odds_b']), book, pred['pred_home'], pred['pred_away'],
+                      int(e['odds_a']), int(e['odds_b']), book or '', pred['pred_home'], pred['pred_away'],
                       e['p_a'], e['p_b'], e['fair_a'], e['ev_a'], e['ev_b'], e['pick']))
     conn.commit()
 
