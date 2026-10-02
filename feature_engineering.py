@@ -1,430 +1,244 @@
 """
-Feature Engineering Layer
-Computes season averages, last 10 games, opponent adjustments, etc.
+Feature engineering: the numeric core shared by live projections AND the backtest.
+
+Model for a player's stat in one game (all inputs strictly before the game):
+
+    minutes_proj  = recency-weighted mean of recent minutes             (short half-life)
+    rate_c        = recency-weighted stat_c per minute, lightly shrunk  (longer half-life)
+                    toward the league per-minute rate
+    opp_factor_c  = how much of stat_c the opponent allows per game vs league average,
+                    recency-weighted and shrunk toward 1.0
+    mean          = sum over components c of  minutes_proj * rate_c * opp_factor_c ** opp_strength
+    variance      = mean + alpha * mean**2   (negative binomial "NB2"), where alpha is the
+                    player's own over-dispersion of the stat, shrunk toward the league value
+                    and scaled by var_scale (calibrated in the backtest)
+
+Combo stats (PRA, PR, ...) are built from their components so each component gets
+its own opponent adjustment; dispersion is measured on the combo series itself so the
+correlation between components is captured.
 """
 
-import sqlite3
+from dataclasses import dataclass, asdict
+
+import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
 
-DB_PATH = 'nba_data.db'
+BASE_STATS = ['pts', 'reb', 'ast', 'stl', 'blk', 'tov', 'fg3m']
+
+STATS = {
+    'PTS': ('pts',),
+    'REB': ('reb',),
+    'AST': ('ast',),
+    'STL': ('stl',),
+    'BLK': ('blk',),
+    'TOV': ('tov',),
+    'FG3M': ('fg3m',),
+    'PRA': ('pts', 'reb', 'ast'),
+    'PR': ('pts', 'reb'),
+    'PA': ('pts', 'ast'),
+    'RA': ('reb', 'ast'),
+    'SB': ('stl', 'blk'),
+}
+
+_ALIASES = {
+    'POINTS': 'PTS', 'P': 'PTS', 'REBOUNDS': 'REB', 'R': 'REB', 'ASSISTS': 'AST', 'A': 'AST',
+    'STEALS': 'STL', 'BLOCKS': 'BLK', 'TURNOVERS': 'TOV', 'TO': 'TOV',
+    '3PM': 'FG3M', '3PT': 'FG3M', '3S': 'FG3M', 'THREES': 'FG3M', '3PTM': 'FG3M',
+    'AR': 'RA', 'P+R+A': 'PRA', 'PTS+REB+AST': 'PRA', 'P+R': 'PR', 'PTS+REB': 'PR',
+    'P+A': 'PA', 'PTS+AST': 'PA', 'R+A': 'RA', 'REB+AST': 'RA', 'S+B': 'SB', 'STL+BLK': 'SB',
+}
 
 
-def get_all_players(season):
-    """Get all distinct players in a season"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT player_name FROM game_logs WHERE season = ? ORDER BY player_name", (season,))
-    players = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return players
+def parse_stat(s):
+    """User/bookmaker stat label -> canonical key in STATS. Raises ValueError if unknown."""
+    key = str(s).strip().upper().replace(' ', '')
+    key = _ALIASES.get(key, key)
+    if key not in STATS:
+        raise ValueError(f"Unknown stat {s!r}. Use one of: {', '.join(STATS)}")
+    return key
 
 
-def normalize_player_name(player_name):
+@dataclass
+class PropParams:
+    half_life_minutes: float = 8.0     # games; minutes react quickly to role changes
+    half_life_rate: float = 25.0       # games; per-minute production is more stable
+    prev_season_weight: float = 0.6    # extra multiplier per season back
+    lookback_seasons: int = 2          # current + previous season
+    max_games: int = 160               # older games have negligible weight anyway
+    rate_prior_minutes: float = 60.0   # pseudo-minutes of league-average production
+    disp_prior_games: float = 20.0     # pseudo-games of league over-dispersion
+    var_scale: float = 1.0             # multiplier on over-dispersion (calibration)
+    opp_half_life: float = 30.0        # games (per team)
+    opp_prior_games: float = 15.0      # pseudo-games of league average for opponent factors
+    opp_strength: float = 1.0          # exponent on opponent factor (0 = ignore opponent)
+    min_games: int = 5                 # refuse to project with fewer prior games
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Weights
+# ---------------------------------------------------------------------------
+
+def recency_weights(seasons, target_season, half_life, prev_season_weight):
+    """Weights for games ordered oldest -> newest: 0.5**(games_ago/half_life),
+    times prev_season_weight for each season before target_season."""
+    n = len(seasons)
+    games_ago = np.arange(n - 1, -1, -1, dtype=float)
+    w = 0.5 ** (games_ago / half_life)
+    back = np.clip(target_season - np.asarray(seasons, dtype=float), 0, None)
+    return w * prev_season_weight ** back
+
+
+def weighted_mean_var(y, w):
+    """Weighted mean and (reliability-weights unbiased) variance."""
+    sw = w.sum()
+    mean = (w * y).sum() / sw
+    denom = sw - (w ** 2).sum() / sw
+    var = (w * (y - mean) ** 2).sum() / denom if denom > 0 else 0.0
+    return mean, var
+
+
+def effective_n(w):
+    """Kish effective sample size."""
+    return w.sum() ** 2 / (w ** 2).sum()
+
+
+# ---------------------------------------------------------------------------
+# League-level priors
+# ---------------------------------------------------------------------------
+
+def league_priors(player_games, min_games=30):
     """
-    Convert player name to exact match from database
-    Handles case-insensitive lookup and partial name matching
-    Returns None if not found, otherwise returns exact name from database
+    From a player_games DataFrame (only data you are allowed to use):
+      rate[c]   = league stat_c per minute
+      alpha[k]  = league NB2 over-dispersion of stat k: pooled (var - mean) / mean**2 over
+                  players with >= min_games games and a meaningful mean
     """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Try exact match first
-    cursor.execute("SELECT player_name FROM game_logs WHERE player_name = ? LIMIT 1", (player_name,))
-    result = cursor.fetchone()
-    if result:
-        conn.close()
-        return result[0]
-    
-    # Try case-insensitive exact match
-    cursor.execute("SELECT DISTINCT player_name FROM game_logs WHERE LOWER(player_name) = LOWER(?) LIMIT 1", (player_name,))
-    result = cursor.fetchone()
-    if result:
-        conn.close()
-        return result[0]
-    
-    # Try partial match (for shortened names like "shai" → "Shai Gilgeous-Alexander")
-    cursor.execute("SELECT DISTINCT player_name FROM game_logs WHERE LOWER(player_name) LIKE LOWER(?) LIMIT 1", (f'%{player_name}%',))
-    result = cursor.fetchone()
-    if result:
-        conn.close()
-        return result[0]
-    
-    conn.close()
-    return None
+    tot_min = player_games['minutes'].sum()
+    rate = {c: player_games[c].sum() / tot_min for c in BASE_STATS}
+    alpha = {}
+    for key, comps in STATS.items():
+        y = player_games[list(comps)].sum(axis=1)
+        st = y.groupby(player_games['player_id']).agg(['mean', 'var', 'size'])
+        st = st[(st['size'] >= min_games) & (st['mean'] >= 0.5)]
+        alpha[key] = max(float((st['var'] - st['mean']).sum() / (st['mean'] ** 2).sum()), 0.0) \
+            if len(st) else 0.1
+    return {'rate': rate, 'alpha': alpha}
 
 
-def get_player_games(player_name, season, limit=None):
-    """Fetch all games for a player in a season, ordered by date"""
-    # Normalize the player name (case-insensitive lookup)
-    player_name = normalize_player_name(player_name)
-    
-    conn = sqlite3.connect(DB_PATH)
-    query = f"""
-        SELECT * FROM game_logs 
-        WHERE player_name = ? AND season = ?
-        ORDER BY game_date ASC
+# ---------------------------------------------------------------------------
+# Opponent factors
+# ---------------------------------------------------------------------------
+
+def team_games_with_allowed(team_games):
+    """Attach the opponent's box score to each team row: allowed_<stat> = what this team gave up."""
+    opp = team_games[['game_id', 'team'] + BASE_STATS].rename(
+        columns={'team': 'opponent', **{c: f'allowed_{c}' for c in BASE_STATS}})
+    out = team_games.merge(opp, on=['game_id', 'opponent'], how='inner')
+    return out.sort_values(['game_date', 'game_id']).reset_index(drop=True)
+
+
+def opponent_factors(tga, as_of, target_season, params):
     """
-    if limit:
-        query += f" LIMIT {limit}"
-    
-    df = pd.read_sql_query(query, conn, params=(player_name, season))
-    conn.close()
-    return df
+    tga: output of team_games_with_allowed. Uses only games with game_date < as_of.
+    Returns {team: {stat_c: factor}} where factor 1.10 = allows 10% more than league average.
+    """
+    hist = tga[(tga['game_date'] < as_of) &
+               (tga['season'] > target_season - params.lookback_seasons)]
+    if hist.empty:
+        return {}
+    cols = [f'allowed_{c}' for c in BASE_STATS]
+    # games-ago per team (0 = most recent)
+    games_ago = hist.groupby('team').cumcount(ascending=False).to_numpy(dtype=float)
+    back = np.clip(target_season - hist['season'].to_numpy(dtype=float), 0, None)
+    w = 0.5 ** (games_ago / params.opp_half_life) * params.prev_season_weight ** back
+    vals = hist[cols].to_numpy(dtype=float)
+    league = (w[:, None] * vals).sum(axis=0) / w.sum()
+
+    df = pd.DataFrame(w[:, None] * vals, columns=cols)
+    df['team'] = hist['team'].to_numpy()
+    df['w'] = w
+    df['w2'] = w ** 2
+    agg = df.groupby('team').sum()
+    n_eff = agg['w'] ** 2 / agg['w2']
+    k = params.opp_prior_games
+    factors = {}
+    for team, row in agg.iterrows():
+        f = {}
+        for i, c in enumerate(BASE_STATS):
+            mean_allowed = row[cols[i]] / row['w']
+            shrunk = (n_eff[team] * mean_allowed + k * league[i]) / (n_eff[team] + k)
+            f[c] = shrunk / league[i] if league[i] > 0 else 1.0
+        factors[team] = f
+    return factors
 
 
-def compute_season_avg(player_name, season):
-    """Compute season average points"""
-    games = get_player_games(player_name, season)
-    
-    if games.empty:
-        return {
-            'season_avg': 0,
-            'games_played': 0,
-            'total_points': 0,
-            'avg_minutes': 0
-        }
-    
-    season_avg = games['points'].mean()
-    games_played = len(games)
-    
+# ---------------------------------------------------------------------------
+# Player projection (pure function of prior games)
+# ---------------------------------------------------------------------------
+
+def project_from_history(hist, stat, target_season, priors, params,
+                         opp_factor=None, minutes=None):
+    """
+    hist: the player's games strictly before the target game, sorted oldest -> newest,
+          with columns season, minutes and BASE_STATS.
+    opp_factor: {stat_c: factor} for the opponent, or None for a neutral opponent.
+    minutes: optional projected-minutes override (e.g. known role change / minutes cap).
+    Returns dict or None when there is not enough history.
+    """
+    stat = parse_stat(stat)
+    comps = STATS[stat]
+    hist = hist[hist['season'] > target_season - params.lookback_seasons]
+    if len(hist) > params.max_games:
+        hist = hist.iloc[-params.max_games:]
+    if len(hist) < params.min_games:
+        return None
+
+    seasons = hist['season'].to_numpy()
+    mins = hist['minutes'].to_numpy(dtype=float)
+    w_min = recency_weights(seasons, target_season, params.half_life_minutes, params.prev_season_weight)
+    w_rate = recency_weights(seasons, target_season, params.half_life_rate, params.prev_season_weight)
+
+    minutes_hist = float((w_min * mins).sum() / w_min.sum())
+    minutes_proj = float(minutes) if minutes is not None else minutes_hist
+
+    m0 = params.rate_prior_minutes
+    denom = (w_rate * mins).sum() + m0
+    mean = 0.0
+    rates, factors = {}, {}
+    for c in comps:
+        x = hist[c].to_numpy(dtype=float)
+        rates[c] = ((w_rate * x).sum() + m0 * priors['rate'][c]) / denom
+        factors[c] = (opp_factor or {}).get(c, 1.0) ** params.opp_strength
+        mean += minutes_proj * rates[c] * factors[c]
+
+    # Over-dispersion of the (combo) series itself, shrunk toward the league value.
+    y = hist[list(comps)].sum(axis=1).to_numpy(dtype=float)
+    y_mean, y_var = weighted_mean_var(y, w_rate)
+    n_eff = effective_n(w_rate)
+    a_prior = priors['alpha'][stat]
+    a_player = (y_var - y_mean) / y_mean ** 2 if y_mean > 0 else a_prior
+    n0 = params.disp_prior_games
+    alpha = max((n_eff * a_player + n0 * a_prior) / (n_eff + n0), 0.0) * params.var_scale
+    var = mean + alpha * mean ** 2
+
+    cur = hist[hist['season'] == target_season]
     return {
-        'season_avg': round(season_avg, 2),
-        'games_played': games_played,
-        'total_points': games['points'].sum(),
-        'avg_minutes': round(games['minutes'].mean(), 1)
+        'stat': stat,
+        'mean': mean,
+        'var': var,
+        'sd': float(np.sqrt(var)),
+        'alpha': alpha,
+        'minutes_proj': minutes_proj,
+        'minutes_hist': minutes_hist,
+        'rates': rates,
+        'opp_factors': factors,
+        'games_used': len(hist),
+        'n_eff': n_eff,
+        'season_avg': float(cur[list(comps)].sum(axis=1).mean()) if len(cur) else None,
+        'season_games': len(cur),
+        'last10_avg': float(y[-10:].mean()),
+        'last5_avg': float(y[-5:].mean()),
     }
-
-
-def compute_last_n_games(player_name, season, n=10):
-    """Compute average stats for last N games"""
-    games = get_player_games(player_name, season)
-    
-    if games.empty:
-        return None
-    
-    # Get last N games
-    last_n = games.tail(n)
-    
-    if last_n.empty:
-        return None
-    
-    return {
-        f'last{n}_avg': round(last_n['points'].mean(), 2),
-        f'last{n}_games': len(last_n),
-        f'last{n}_min_avg': round(last_n['minutes'].mean(), 1),
-        f'last{n}_usage_proxy': round(
-            (last_n['fga'].sum() + last_n['fta'].sum() + 0.44 * last_n['fta'].sum()) / len(last_n), 2
-        )
-    }
-
-
-def extract_opponent(matchup_str):
-    """Extract opponent from MATCHUP string (e.g., 'LAL vs GSW' -> 'GSW')"""
-    if pd.isna(matchup_str):
-        return None
-    
-    parts = str(matchup_str).split()
-    if len(parts) >= 3:
-        # Format: "TEAM vs OPPONENT" or "TEAM @ OPPONENT"
-        return parts[2]
-    return None
-
-
-def compute_opponent_adjustment(player_name, season, opponent=None):
-    """
-    Compute adjustment based on opponent defense
-    Returns opponent's average points allowed per game to similar players
-    
-    Opponent format in DB is "TEAM @ OPPONENT" or "TEAM vs. OPPONENT"
-    We extract just the opponent team code (last token)
-    """
-    games = get_player_games(player_name, season)
-    
-    if games.empty:
-        return 0
-    
-    # If specific opponent provided, filter to those games only
-    if opponent:
-        # Extract opponent code from matchup strings
-        # "LAL @ GSW" -> opponent is "GSW"
-        # "BOS vs. LAL" -> opponent is "LAL"
-        def extract_opp_code(matchup):
-            if pd.isna(matchup):
-                return None
-            parts = str(matchup).split()
-            if len(parts) >= 3:
-                return parts[-1]  # Last token is opponent
-            return None
-        
-        games['opp_code'] = games['opponent'].apply(extract_opp_code)
-        opponent_games = games[games['opp_code'] == opponent]
-        
-        if opponent_games.empty:
-            return 0
-        
-        opp_avg = opponent_games['points'].mean()
-    else:
-        # Use season average as baseline (no adjustment)
-        opp_avg = games['points'].mean()
-    
-    season_avg = games['points'].mean()
-    adjustment = opp_avg - season_avg
-    
-    return round(adjustment, 2)
-
-
-def compute_minutes_projection(player_name, season, projected_minutes=None):
-    """
-    Compute minutes-adjusted projection
-    If projected_minutes not provided, uses season average
-    """
-    games = get_player_games(player_name, season)
-    
-    if games.empty:
-        return 1.0
-    
-    avg_minutes = games['minutes'].mean()
-    
-    if projected_minutes is None:
-        return 1.0
-    
-    if avg_minutes == 0:
-        return 1.0
-    
-    multiplier = projected_minutes / avg_minutes
-    return round(multiplier, 2)
-
-
-def get_stat_column(stat_type):
-    """
-    Map stat type to database column(s)
-    
-    Supported stat types:
-    - PTS: Points
-    - AST: Assists
-    - REB: Rebounds
-    - BLK: Blocks (NOTE: Not in database, estimated)
-    - STL: Steals (NOTE: Not in database, estimated)
-    - PRA: Points + Rebounds + Assists
-    - PA: Points + Assists
-    - PR: Points + Rebounds
-    - AR: Assists + Rebounds
-    - RA: Rebounds + Assists
-    """
-    stat_type = stat_type.upper()
-    
-    # Database has: points, assists, rebounds
-    # Note: blocks and steals not available in database
-    column_map = {
-        'PTS': 'points',
-        'AST': 'assists',
-        'REB': 'rebounds',
-        'BLK': 'blocks',      # Not in DB, will use 0
-        'STL': 'steals',      # Not in DB, will use 0
-    }
-    
-    # Combo stats
-    combo_stats = ['PRA', 'PA', 'PR', 'AR', 'RA']
-    
-    if stat_type in column_map:
-        return column_map[stat_type], [stat_type]
-    elif stat_type in combo_stats:
-        return stat_type, stat_type.list()  # Will be computed separately
-    else:
-        return 'points', ['PTS']  # Default to points
-
-
-def compute_stat_value(games, stat_type):
-    """
-    Calculate the stat value for all games
-    Handles both single stats and combos (PRA, PA, etc.)
-    
-    Note: BLK and STL not in database, defaults to 0
-    """
-    stat_type = stat_type.upper()
-    
-    if stat_type == 'PTS':
-        return games['points']
-    elif stat_type == 'AST':
-        return games['assists']
-    elif stat_type == 'REB':
-        return games['rebounds']
-    elif stat_type == 'BLK':
-        # Blocks not in database, return 0 (or we could estimate from other stats)
-        return 0
-    elif stat_type == 'STL':
-        # Steals not in database, return 0 (or we could estimate from other stats)
-        return 0
-    elif stat_type == 'PRA':
-        return games['points'] + games['rebounds'] + games['assists']
-    elif stat_type == 'PA':
-        return games['points'] + games['assists']
-    elif stat_type == 'PR':
-        return games['points'] + games['rebounds']
-    elif stat_type == 'AR':
-        return games['assists'] + games['rebounds']
-    elif stat_type == 'RA':
-        return games['rebounds'] + games['assists']
-    else:
-        return games['points']  # Default
-
-
-def compute_season_avg_for_stat(player_name, season, stat_type='PTS'):
-    """Compute season average for any stat type"""
-    games = get_player_games(player_name, season)
-    
-    if games.empty:
-        return {
-            'season_avg': 0,
-            'games_played': 0,
-            'total_stat': 0,
-            'avg_minutes': 0
-        }
-    
-    stat_values = compute_stat_value(games, stat_type)
-    season_avg = stat_values.mean()
-    games_played = len(games)
-    
-    return {
-        'season_avg': round(season_avg, 2),
-        'games_played': games_played,
-        'total_stat': stat_values.sum(),
-        'avg_minutes': round(games['minutes'].mean(), 1)
-    }
-
-
-def compute_last_n_games_for_stat(player_name, season, n=10, stat_type='PTS'):
-    """Compute average stats for last N games for any stat type"""
-    games = get_player_games(player_name, season)
-    
-    if games.empty:
-        return None
-    
-    # Get last N games
-    last_n = games.tail(n)
-    stat_values = compute_stat_value(last_n, stat_type)
-    
-    return {
-        f'last{n}_avg': round(stat_values.mean(), 2),
-        f'last{n}_games': len(last_n),
-    }
-
-
-def get_full_player_features(player_name, season, stat_type='PTS', game_date=None, opponent=None, projected_minutes=None):
-    """
-    Comprehensive feature computation for a player for ANY stat type
-    Returns dict with all features needed for projection
-    
-    Args:
-        player_name: Player name
-        season: NBA season
-        stat_type: 'PTS', 'AST', 'REB', 'BLK', 'STL', 'PRA', 'PA', 'PR', etc.
-        game_date: Optional game date
-        opponent: Optional opponent code
-        projected_minutes: Optional projected minutes
-    """
-    
-    season_stats = compute_season_avg_for_stat(player_name, season, stat_type)
-    last10_stats = compute_last_n_games_for_stat(player_name, season, n=10, stat_type=stat_type)
-    last5_stats = compute_last_n_games_for_stat(player_name, season, n=5, stat_type=stat_type)
-    
-    if season_stats['games_played'] == 0:
-        return None
-    
-    opp_adj = compute_opponent_adjustment(player_name, season, opponent)
-    minutes_multiplier = compute_minutes_projection(player_name, season, projected_minutes)
-    
-    features = {
-        'player_name': player_name,
-        'season': season,
-        'stat_type': stat_type,
-        'game_date': game_date,
-        'opponent': opponent,
-        
-        # Season stats
-        'season_avg': season_stats['season_avg'],
-        'games_played': season_stats['games_played'],
-        'avg_minutes': season_stats['avg_minutes'],
-        
-        # Last 10 games
-        'last10_avg': last10_stats['last10_avg'] if last10_stats else season_stats['season_avg'],
-        'last10_games': last10_stats['last10_games'] if last10_stats else 0,
-        
-        # Last 5 games
-        'last5_avg': last5_stats['last5_avg'] if last5_stats else season_stats['season_avg'],
-        'last5_games': last5_stats['last5_games'] if last5_stats else 0,
-        
-        # Opponent & minutes
-        'opponent_adjustment': opp_adj,
-        'opponent_adjusted_avg': round(season_stats['season_avg'] + opp_adj, 2),
-        'projected_minutes': projected_minutes,
-        'minutes_multiplier': minutes_multiplier,
-    }
-    
-    return features
-
-
-def generate_player_report(player_name, season):
-    """Generate a detailed report for a player"""
-    features = get_full_player_features(player_name, season)
-    
-    if features is None:
-        print(f"❌ No data for {player_name}")
-        return
-    
-    print(f"\n{'='*60}")
-    print(f"📊 {player_name.upper()} - {season} Season Report")
-    print(f"{'='*60}")
-    print(f"Games Played: {features['games_played']}")
-    print(f"Avg Minutes: {features['avg_minutes']}")
-    print(f"\n📈 Scoring Averages:")
-    print(f"  Season Avg:            {features['season_avg']} PPG")
-    print(f"  Last 10 Avg:           {features['last10_avg']} PPG")
-    print(f"  Last 5 Avg:            {features['last5_avg']} PPG")
-    print(f"\n🛡️  Opponent Adjustment: {features['opponent_adjustment']:+.2f}")
-    print(f"  Opponent-Adjusted Avg: {features['opponent_adjusted_avg']} PPG")
-    print(f"{'='*60}\n")
-
-
-def export_features_to_csv(season=2026, output_file='player_features.csv'):
-    """Export features for all players to CSV"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Get unique players
-    cursor.execute("SELECT DISTINCT player_name FROM game_logs WHERE season = ? ORDER BY player_name", (season,))
-    players = cursor.fetchall()
-    conn.close()
-    
-    features_list = []
-    
-    for (player_name,) in players:
-        features = get_full_player_features(player_name, season)
-        if features:
-            features_list.append(features)
-    
-    df = pd.DataFrame(features_list)
-    df.to_csv(output_file, index=False)
-    print(f"✅ Exported {len(features_list)} players to {output_file}")
-    return df
-
-
-if __name__ == '__main__':
-    # Example: Generate report for LeBron James
-    generate_player_report("LeBron James", 2025)
-    
-    # Example: Get full features
-    features = get_full_player_features(
-        "LeBron James", 
-        season=2025,
-        opponent="GSW",
-        projected_minutes=35
-    )
-    print("\n📋 Full Features:")
-    for key, val in features.items():
-        print(f"  {key}: {val}")
-    
-    # Export all player features
-    print("\n🔄 Exporting features for all players...")
-    export_features_to_csv(season=2025)

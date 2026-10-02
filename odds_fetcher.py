@@ -1,224 +1,207 @@
 #!/usr/bin/env python3
 """
-Fetch live NBA props from The Odds API
-Supports multiple sportsbooks (DraftKings, FanDuel, BetMGM, etc.)
+The Odds API (v4) client.
 
-NOTE: Player props market requires a paid subscription on The Odds API.
-The free tier only includes head-to-head (h2h) odds.
+Credits (check your plan; usage is printed after every call):
+  * /events                       — list of games, no market data
+  * /odds  (game lines)           — 1 credit per market per region, for ALL games at once.
+                                    h2h + spreads + totals for the whole slate = 3 credits.
+  * /events/{id}/odds (props)     — 1 credit per market per region, PER GAME.
+                                    1 market x 10 games = 10 credits a day.
+Player props are only served by the per-event endpoint; asking /odds for player markets
+fails. One region ('us') covers all the main US books, so line-shopping across books costs
+nothing extra.
 
-For demo purposes, this includes mock data. Replace with real API when upgraded.
+Usage:
+    python odds_fetcher.py events                 # list today's games
+    python odds_fetcher.py games                  # today's spreads/totals/moneylines
+    python odds_fetcher.py props --markets player_points --max-events 2
 """
 
+import argparse
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import requests
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import time
-import json
 
-# Load API key from .env
+from db import team_abbr, to_date
+
 load_dotenv()
-ODDS_API_KEY = os.getenv('ODDS_API_KEY')
-
-if not ODDS_API_KEY:
-    raise ValueError("❌ ODDS_API_KEY not found in .env file")
-
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
+ET = ZoneInfo("America/New_York")
 
-# Stat type mappings
-STAT_MARKETS = {
+PROP_MARKETS = {
     'player_points': 'PTS',
     'player_rebounds': 'REB',
     'player_assists': 'AST',
-    'player_passes': 'AST',
+    'player_threes': 'FG3M',
+    'player_blocks': 'BLK',
+    'player_steals': 'STL',
+    'player_turnovers': 'TOV',
+    'player_points_rebounds_assists': 'PRA',
+    'player_points_rebounds': 'PR',
+    'player_points_assists': 'PA',
+    'player_rebounds_assists': 'RA',
+    'player_blocks_steals': 'SB',
 }
 
-BOOKMAKERS = [
-    'draftkings',
-    'fanduel',
-    'betmgm',
-    'pointsbet',
-    'caesars',
-    'espn',
-]
+
+class OddsAPIError(RuntimeError):
+    pass
 
 
-def fetch_upcoming_events():
-    """Fetch upcoming NBA games"""
-    print("🔄 Fetching upcoming NBA games...")
-    
-    response = requests.get(
-        f"{BASE_URL}/sports/{SPORT}/events",
-        params={
-            'apiKey': ODDS_API_KEY,
-        },
-        timeout=10
-    )
-    
-    if response.status_code != 200:
-        print(f"❌ API Error: {response.status_code}")
-        print(f"   Response: {response.text}")
-        return []
-    
-    events = response.json()
-    print(f"✅ Found {len(events)} upcoming games")
-    return events
+def _api_key():
+    key = os.getenv('ODDS_API_KEY')
+    if not key:
+        raise OddsAPIError("ODDS_API_KEY not set. Put ODDS_API_KEY=... in a .env file.")
+    return key
 
 
-# Mock data for testing (since free tier doesn't include player props)
-MOCK_PROPS = [
-    {'player_name': 'Shai Gilgeous-Alexander', 'stat_type': 'PTS', 'line': 30.5, 'odds': -110, 'bookmaker': 'draftkings', 'event_id': '1', 'commence_time': '2026-05-09T23:30Z'},
-    {'player_name': 'LeBron James', 'stat_type': 'PTS', 'line': 25.5, 'odds': -110, 'bookmaker': 'fanduel', 'event_id': '2', 'commence_time': '2026-05-09T23:30Z'},
-    {'player_name': 'Stephen Curry', 'stat_type': 'PTS', 'line': 28.5, 'odds': -110, 'bookmaker': 'betmgm', 'event_id': '3', 'commence_time': '2026-05-09T23:30Z'},
-    {'player_name': 'Jalen Johnson', 'stat_type': 'REB', 'line': 8.5, 'odds': +100, 'bookmaker': 'draftkings', 'event_id': '4', 'commence_time': '2026-05-10T00:00Z'},
-    {'player_name': 'De\'Aaron Fox', 'stat_type': 'AST', 'line': 5.5, 'odds': -110, 'bookmaker': 'fanduel', 'event_id': '5', 'commence_time': '2026-05-10T00:00Z'},
-    {'player_name': 'Jayson Tatum', 'stat_type': 'PTS', 'line': 26.5, 'odds': -110, 'bookmaker': 'betmgm', 'event_id': '6', 'commence_time': '2026-05-10T00:30Z'},
-    {'player_name': 'Luka Doncic', 'stat_type': 'PTS', 'line': 32.5, 'odds': -120, 'bookmaker': 'draftkings', 'event_id': '7', 'commence_time': '2026-05-10T01:00Z'},
-    {'player_name': 'Giannis Antetokounmpo', 'stat_type': 'REB', 'line': 11.5, 'odds': -110, 'bookmaker': 'fanduel', 'event_id': '8', 'commence_time': '2026-05-10T01:30Z'},
-]
+def _get(path, **params):
+    params['apiKey'] = _api_key()
+    r = requests.get(f"{BASE_URL}{path}", params=params, timeout=20)
+    used, remaining, last = (r.headers.get(h) for h in
+                             ('x-requests-used', 'x-requests-remaining', 'x-requests-last'))
+    if remaining is not None:
+        print(f"   (Odds API: this call {last} credits, used {used}, remaining {remaining})")
+    if r.status_code != 200:
+        raise OddsAPIError(f"{r.status_code} from {path}: {r.text[:300]}")
+    return r.json()
 
 
-def fetch_props_for_market(market='player_points'):
+def et_date(commence_time):
+    """ISO UTC timestamp -> US/Eastern calendar date string (NBA schedule dates are ET)."""
+    dt = datetime.fromisoformat(commence_time.replace('Z', '+00:00'))
+    return dt.astimezone(ET).date().isoformat()
+
+
+def fetch_events(date=None):
+    """Games on `date` (ET, default today) with home/away abbreviations."""
+    target = to_date(date).isoformat() if date else datetime.now(ET).date().isoformat()
+    out = []
+    for e in _get(f"/sports/{SPORT}/events"):
+        if et_date(e['commence_time']) != target:
+            continue
+        out.append({'event_id': e['id'], 'game_date': target, 'commence_time': e['commence_time'],
+                    'home': team_abbr(e['home_team']), 'away': team_abbr(e['away_team']),
+                    'home_name': e['home_team'], 'away_name': e['away_team']})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Player props
+# ---------------------------------------------------------------------------
+
+def parse_event_props(data, game_date=None):
     """
-    Fetch all player props for a specific market
-    
-    NOTE: Player props require paid subscription.
-    Using mock data for demo - replace with real API when upgraded.
+    Parse one /events/{id}/odds response into paired over/under rows:
+    {book, player, stat, market, line, over_odds, under_odds, home, away, game_date, event_id}
+    Rows where the book only offers one side are dropped (no way to remove the vig).
     """
-    print(f"\n🔄 Fetching {market} props...")
-    print(f"   ⚠️  Using mock data (free tier limitation)")
-    
-    # In production, this would call:
-    # response = requests.get(
-    #     f"{BASE_URL}/sports/{SPORT}/odds",
-    #     params={
-    #         'apiKey': ODDS_API_KEY,
-    #         'markets': market,
-    #         'odds_format': 'american',
-    #         'regions': 'us',
-    #         'bookmakers': 'draftkings,fanduel,betmgm',
-    #     },
-    #     timeout=10
-    # )
-    
-    return MOCK_PROPS  # Return mock data for now
-
-
-def parse_props(results, market='player_points'):
-    """
-    Parse props from API response into flat list
-    
-    Returns list of dicts:
-    {
-        'player_name': 'Shai Gilgeous-Alexander',
-        'stat_type': 'PTS',
-        'line': 30.5,
-        'odds': -110,
-        'bookmaker': 'draftkings',
-        'event_id': '123456',
-        'commence_time': '2026-04-12T23:30Z'
-    }
-    """
-    # If already parsed (mock data), return as-is
-    if results and isinstance(results[0], dict) and 'player_name' in results[0]:
-        return results
-    
-    # Otherwise parse from API format
-    props = []
-    stat_type = STAT_MARKETS.get(market, market.upper())
-    
-    for event in results:
-        event_id = event.get('id')
-        commence_time = event.get('commence_time')
-        
-        for bookmaker in event.get('bookmakers', []):
-            bookmaker_key = bookmaker.get('key', 'unknown')
-            
-            for market_data in bookmaker.get('markets', []):
-                if market_data.get('key') != market:
+    home, away = team_abbr(data.get('home_team', '')), team_abbr(data.get('away_team', ''))
+    gd = game_date or (et_date(data['commence_time']) if data.get('commence_time') else None)
+    pairs = {}
+    for bk in data.get('bookmakers', []):
+        for m in bk.get('markets', []):
+            stat = PROP_MARKETS.get(m.get('key'))
+            if stat is None:
+                continue
+            for o in m.get('outcomes', []):
+                side = str(o.get('name', '')).lower()
+                player = o.get('description')
+                line, price = o.get('point'), o.get('price')
+                if side not in ('over', 'under') or not player or line is None or price is None:
                     continue
-                
-                for outcome in market_data.get('outcomes', []):
-                    player_name = outcome.get('name', '')
-                    line = outcome.get('point')
-                    odds = outcome.get('odds')
-                    
-                    # Skip if missing critical data
-                    if not player_name or line is None or odds is None:
-                        continue
-                    
-                    props.append({
-                        'player_name': player_name,
-                        'stat_type': stat_type,
-                        'line': float(line),
-                        'odds': int(odds),
-                        'bookmaker': bookmaker_key,
-                        'event_id': event_id,
-                        'commence_time': commence_time,
-                    })
-    
-    return props
+                key = (bk['key'], player, m['key'], float(line))
+                pairs.setdefault(key, {})[side] = int(round(float(price)))
+    rows = []
+    for (book, player, market, line), sides in pairs.items():
+        if 'over' in sides and 'under' in sides:
+            rows.append({'book': book, 'player': player, 'stat': PROP_MARKETS[market], 'market': market,
+                         'line': line, 'over_odds': sides['over'], 'under_odds': sides['under'],
+                         'home': home, 'away': away, 'game_date': gd, 'event_id': data.get('id')})
+    return rows
 
 
-def fetch_all_props():
-    """
-    Fetch ALL available player props from multiple markets
-    
-    Returns list of all props across markets
-    """
-    all_props = []
-    
-    # Fetch multiple stat types
-    markets_to_fetch = ['player_points', 'player_rebounds', 'player_assists']
-    
-    for market in markets_to_fetch:
-        try:
-            results = fetch_props_for_market(market)
-            parsed = parse_props(results, market)
-            all_props.extend(parsed)
-            time.sleep(0.5)  # Be nice to the API
-        except Exception as e:
-            print(f"⚠️  Error fetching {market}: {e}")
-    
-    print(f"\n📊 Total props fetched: {len(all_props)}")
-    return all_props
+def fetch_props(date=None, markets=('player_points',), regions='us', bookmakers=None, max_events=None):
+    unknown = [m for m in markets if m not in PROP_MARKETS]
+    if unknown:
+        raise ValueError(f"Unknown prop markets {unknown}. Options: {', '.join(PROP_MARKETS)}")
+    events = fetch_events(date)
+    if max_events:
+        events = events[:max_events]
+    n_regions = 1 if bookmakers else len(regions.split(','))
+    print(f"🔄 {len(events)} games; estimated cost {len(events) * len(markets) * n_regions} credits")
+    rows = []
+    for e in events:
+        params = {'markets': ','.join(markets), 'oddsFormat': 'american'}
+        if bookmakers:
+            params['bookmakers'] = bookmakers
+        else:
+            params['regions'] = regions
+        data = _get(f"/sports/{SPORT}/events/{e['event_id']}/odds", **params)
+        rows.extend(parse_event_props(data, e['game_date']))
+    return rows
 
 
-def get_live_props_sample():
-    """
-    Get a small sample of live props for testing
-    """
-    print("🔄 Fetching sample props for testing...")
-    
-    try:
-        results = fetch_props_for_market('player_points')
-        props = parse_props(results, 'player_points')
-        return props[:10]  # Return first 10
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return []
+# ---------------------------------------------------------------------------
+# Game lines
+# ---------------------------------------------------------------------------
+
+def parse_game_lines(events, book, date=None):
+    """Parse an /odds response (h2h, spreads, totals) for one bookmaker."""
+    out = []
+    for e in events:
+        gd = et_date(e['commence_time'])
+        if date and gd != date:
+            continue
+        bk = next((b for b in e.get('bookmakers', []) if b['key'] == book), None)
+        if bk is None:
+            continue
+        hn, an = e['home_team'], e['away_team']
+        g = {'game_date': gd, 'home': team_abbr(hn), 'away': team_abbr(an), 'book': book}
+        for m in bk.get('markets', []):
+            oc = {o['name']: o for o in m.get('outcomes', [])}
+            if m['key'] == 'h2h' and hn in oc and an in oc:
+                g['ml'] = (int(oc[hn]['price']), int(oc[an]['price']))
+            elif m['key'] == 'spreads' and hn in oc and an in oc:
+                g['spread'] = float(oc[hn]['point'])
+                g['spread_odds'] = (int(oc[hn]['price']), int(oc[an]['price']))
+            elif m['key'] == 'totals' and 'Over' in oc and 'Under' in oc:
+                g['total'] = float(oc['Over']['point'])
+                g['total_odds'] = (int(oc['Over']['price']), int(oc['Under']['price']))
+        out.append(g)
+    return out
+
+
+def fetch_game_lines(book='draftkings', date=None, markets='h2h,spreads,totals'):
+    target = to_date(date).isoformat() if date else datetime.now(ET).date().isoformat()
+    events = _get(f"/sports/{SPORT}/odds", bookmakers=book, markets=markets, oddsFormat='american')
+    return parse_game_lines(events, book, target)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('what', choices=['events', 'games', 'props'])
+    ap.add_argument('--date')
+    ap.add_argument('--book', default='draftkings')
+    ap.add_argument('--markets', nargs='+', default=['player_points'])
+    ap.add_argument('--max-events', type=int, default=1)
+    a = ap.parse_args()
+    if a.what == 'events':
+        for e in fetch_events(a.date):
+            print(f"{e['game_date']}  {e['away']} @ {e['home']}  {e['commence_time']}  {e['event_id']}")
+    elif a.what == 'games':
+        for g in fetch_game_lines(a.book, a.date):
+            print(g)
+    else:
+        for r in fetch_props(a.date, a.markets, max_events=a.max_events)[:40]:
+            print(f"{r['book']:<12} {r['player']:<26} {r['stat']:<5} {r['line']:>5}  "
+                  f"O {r['over_odds']:+d} / U {r['under_odds']:+d}")
 
 
 if __name__ == '__main__':
-    # Test the API
-    print("\n" + "="*60)
-    print("🧪 TESTING ODDS API CONNECTION")
-    print("="*60)
-    
-    # Test 1: Check API key
-    print(f"\n✅ API Key loaded: {ODDS_API_KEY[:10]}...")
-    
-    # Test 2: Fetch sample props
-    props = get_live_props_sample()
-    
-    if props:
-        print(f"\n✅ Successfully fetched {len(props)} props!")
-        print("\nSample props:")
-        for i, prop in enumerate(props[:5], 1):
-            print(f"{i}. {prop['player_name']:30} | {prop['stat_type']} {prop['line']:5} @ {prop['odds']:6} ({prop['bookmaker']})")
-        print("\n📝 NOTE: Using mock data (free tier limitation)")
-        print("   To use real player props, upgrade to paid The Odds API plan")
-    else:
-        print("\n⚠️  Could not fetch props - check API key")
-
+    main()

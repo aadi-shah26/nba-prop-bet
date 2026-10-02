@@ -1,208 +1,110 @@
 #!/usr/bin/env python3
 """
-Daily Bet Generation Pipeline
-Fetches live props from The Odds API
-Generates bet signals for all props
-Outputs actionable bets to CSV
+Daily prop pipeline: Odds API props -> projections -> both sides evaluated -> CSV + log.
+
+Costs Odds API credits: (#games) x (#markets) per run for the 'us' region, which covers
+all major US books — so every prop is line-shopped across books for free. The best-EV
+book/side per player+stat is kept.
+
+Usage:
+    python generate_daily_bets.py                                  # points props, today
+    python generate_daily_bets.py --markets player_points player_rebounds --max-events 3
+    python generate_daily_bets.py --date 2026-11-01 --min-ev 0.04
 """
 
+import argparse
 import csv
-import sqlite3
-from datetime import datetime
-from odds_fetcher import fetch_all_props
-from bet_signals import generate_bet_signal
-from projection_model import get_latest_season
-from feature_engineering import normalize_player_name
 
-OUTPUT_DIR = 'daily_bets'
-import os
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from bet_signals import MIN_EV, evaluate_prop, log_prop
+from db import ROOT, connect, find_players, init_db
+from odds_fetcher import PROP_MARKETS, fetch_props
+from projection_model import PropContext
 
-
-def get_all_players_in_db(season):
-    """Get list of all players in database"""
-    conn = sqlite3.connect('nba_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT player_name FROM game_logs WHERE season = ?", (season,))
-    players = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return players
+OUT_DIR = ROOT / 'daily_bets'
+CSV_COLS = ['game_date', 'player_name', 'team', 'opponent', 'stat', 'line', 'book', 'over_odds',
+            'under_odds', 'proj_mean', 'proj_sd', 'fair_line', 'p_over', 'p_under', 'p_push',
+            'fair_over', 'ev_over', 'ev_under', 'pick', 'best_ev', 'kelly', 'warnings']
 
 
-def match_player_to_db(player_name, season):
-    """
-    Try to match prop player name to database player name
-    Returns normalized name or None if not found
-    """
-    # Try exact match first
-    normalized = normalize_player_name(player_name)
-    if normalized:
-        return normalized
-    
-    # If normalize fails, return None
-    return None
+def resolve(conn, name, home, away):
+    """Match a bookmaker player name to a DB player on one of the two teams."""
+    cands = find_players(conn, name, teams=[home, away])
+    if cands.empty:                   # traded since last game in DB, etc.
+        cands = find_players(conn, name)
+    if cands.empty or cands['norm'].nunique() > 1:
+        return None
+    return cands.iloc[0]
 
 
-def generate_daily_bets(max_props=None):
-    """
-    Main pipeline:
-    1. Fetch props from API
-    2. Match to players in database
-    3. Generate signals for all
-    4. Output bets to CSV
-    """
-    
-    print("\n" + "="*80)
-    print("🎯 DAILY BET GENERATION PIPELINE")
-    print("="*80)
-    
-    season = get_latest_season()
-    print(f"\n📅 Season: {season}")
-    print(f"⏰ Timestamp: {datetime.now().isoformat()}")
-    
-    # Step 1: Fetch props
-    print("\n[1/4] Fetching props from The Odds API...")
-    props = fetch_all_props()
-    
+def run(date=None, markets=('player_points',), min_ev=MIN_EV, max_events=None, log=True):
+    conn = connect()
+    init_db(conn)
+    props = fetch_props(date, markets, max_events=max_events)
     if not props:
-        print("❌ No props found!")
-        return
-    
-    print(f"✅ Found {len(props)} total props")
-    
-    if max_props:
-        props = props[:max_props]
-        print(f"⚠️  Limiting to {max_props} for testing")
-    
-    # Step 2: Match players and generate signals
-    print(f"\n[2/4] Matching players and generating signals...")
-    
-    matched_bets = []
-    skipped_players = set()
-    
-    for i, prop in enumerate(props, 1):
-        player_api = prop['player_name']
-        stat_type = prop['stat_type']
-        line = prop['line']
-        odds = prop['odds']
-        bookmaker = prop['bookmaker']
-        
-        # Try to match to database
-        player_db = match_player_to_db(player_api, season)
-        
-        if not player_db:
-            skipped_players.add(player_api)
+        print("No props returned (no games, or markets not posted yet).")
+        return []
+    ctx = PropContext(conn, props[0]['game_date'])
+    print(f"📊 {len(props)} book/prop rows; projecting with data through {ctx.last_data_date}")
+
+    best = {}
+    unmatched = set()
+    for pr in props:
+        pl = resolve(conn, pr['player'], pr['home'], pr['away'])
+        if pl is None:
+            unmatched.add(pr['player'])
             continue
-        
-        # Generate bet signal
-        try:
-            signal = generate_bet_signal(
-                player_name=player_db,
-                stat_type=stat_type,
-                line=line,
-                american_odds=odds,
-                bet_type='OVER',  # Default to OVER (can be enhanced)
-                opponent='',
-                season=season
-            )
-            
-            # Add metadata
-            signal['player_api_name'] = player_api
-            signal['bookmaker'] = bookmaker
-            signal['commence_time'] = prop.get('commence_time', '')
-            signal['event_id'] = prop.get('event_id', '')
-            
-            matched_bets.append(signal)
-            
-            if i % 20 == 0:
-                print(f"  ✓ Processed {i}/{len(props)} props...")
-        
-        except Exception as e:
-            print(f"  ⚠️  Error processing {player_db} {stat_type}: {e}")
-    
-    print(f"✅ Generated signals for {len(matched_bets)} props")
-    print(f"⚠️  Skipped {len(skipped_players)} players not in database")
-    
-    if skipped_players and len(skipped_players) <= 20:
-        print(f"   Skipped players: {', '.join(list(skipped_players)[:10])}")
-    
-    # Step 3: Filter to actionable bets
-    print(f"\n[3/4] Filtering to actionable bets...")
-    
-    actionable_bets = [
-        b for b in matched_bets 
-        if b.get('signal') == 'BET' and b.get('ev_percentage', 0) > 3.0
-    ]
-    
-    print(f"✅ Found {len(actionable_bets)} actionable bets (EV > 3%)")
-    
-    # Sort by EV descending
-    actionable_bets.sort(key=lambda x: x.get('ev_percentage', 0), reverse=True)
-    
-    # Step 4: Output to CSV
-    print(f"\n[4/4] Outputting results to CSV...")
-    
-    timestamp = datetime.now().strftime('%Y-%m-%d')
-    csv_file = f"{OUTPUT_DIR}/bets_{timestamp}.csv"
-    
-    if actionable_bets:
-        with open(csv_file, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                'player_name',
-                'stat_type',
-                'line',
-                'projection',
-                'edge',
-                'odds',
-                'probability',
-                'ev_percentage',
-                'signal',
-                'bookmaker',
-                'season_avg',
-                'last_10_avg',
-            ])
-            writer.writeheader()
-            
-            for bet in actionable_bets:
-                writer.writerow({
-                    'player_name': bet.get('player_name', ''),
-                    'stat_type': bet.get('stat_type', ''),
-                    'line': bet.get('line', ''),
-                    'projection': round(bet.get('projection', 0), 2),
-                    'edge': round(bet.get('edge', 0), 2),
-                    'odds': bet.get('odds', ''),
-                    'probability': round(bet.get('probability', 0), 4),
-                    'ev_percentage': round(bet.get('ev_percentage', 0), 2),
-                    'signal': bet.get('signal', ''),
-                    'bookmaker': bet.get('bookmaker', ''),
-                    'season_avg': round(bet.get('season_avg', 0), 2),
-                    'last_10_avg': round(bet.get('last_10_avg', 0), 2),
-                })
-        
-        print(f"✅ Saved to: {csv_file}")
-    else:
-        print(f"⚠️  No actionable bets found (EV > 3%)")
-    
-    # Print summary
-    print("\n" + "="*80)
-    print("📊 SUMMARY")
-    print("="*80)
-    print(f"Total props fetched:        {len(props)}")
-    print(f"Matched to database:        {len(matched_bets)}")
-    print(f"Actionable bets (EV > 3%):  {len(actionable_bets)}")
-    
-    if actionable_bets:
-        avg_ev = sum(b.get('ev_percentage', 0) for b in actionable_bets) / len(actionable_bets)
-        print(f"Average EV:                 {avg_ev:.2f}%")
-        print(f"\n🎯 Top 3 Bets:")
-        for i, bet in enumerate(actionable_bets[:3], 1):
-            print(f"   {i}. {bet['player_name']:25} {bet['stat_type']} {bet['line']:.1f} @ {bet['odds']:6} | EV: {bet['ev_percentage']:6.2f}%")
-    
-    print(f"\n✅ Completed at {datetime.now().isoformat()}\n")
-    
-    return actionable_bets
+        team = pl['team']
+        opp = pr['away'] if team == pr['home'] else pr['home'] if team == pr['away'] else None
+        r = evaluate_prop(ctx, pl['player_id'], pr['stat'], pr['line'], pr['over_odds'],
+                          pr['under_odds'], opponent=opp, min_ev=min_ev)
+        if r is None:
+            continue
+        r['book'] = pr['book']
+        r['best_ev'] = max(r['ev_over'], r['ev_under'])
+        if opp is None:
+            r['warnings'].append("Player's DB team isn't in this game (trade?) — opponent not applied.")
+        key = (r['player_id'], r['stat'])
+        if key not in best or r['best_ev'] > best[key]['best_ev']:
+            best[key] = r
+
+    rows = sorted(best.values(), key=lambda r: r['best_ev'], reverse=True)
+    if unmatched:
+        print(f"⚠️  {len(unmatched)} names not matched to the DB: {', '.join(sorted(unmatched)[:10])}")
+
+    OUT_DIR.mkdir(exist_ok=True)
+    path = OUT_DIR / f"props_{ctx.game_date}.csv"
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=CSV_COLS, extrasaction='ignore')
+        w.writeheader()
+        for r in rows:
+            w.writerow({**r, 'proj_mean': round(r['mean'], 2), 'proj_sd': round(r['sd'], 2),
+                        **{k: round(r[k], 4) for k in ('p_over', 'p_under', 'p_push', 'fair_over',
+                                                       'ev_over', 'ev_under', 'best_ev', 'kelly')},
+                        'warnings': ' | '.join(r['warnings'])})
+            if log:
+                log_prop(conn, r, r['book'])
+
+    picks = [r for r in rows if r['pick'] != 'PASS']
+    print(f"\n✅ {len(rows)} props evaluated -> {path}")
+    print(f"🎯 {len(picks)} with EV >= {min_ev:.0%}:")
+    for r in picks:
+        odds = r['over_odds'] if r['pick'] == 'OVER' else r['under_odds']
+        flag = ' ⚠️' if r['warnings'] else ''
+        print(f"   {r['player_name']:<26} {r['pick']:<5} {r['line']:>5g} {r['stat']:<4} {odds:+d} @ {r['book']:<12}"
+              f" proj {r['mean']:5.1f}  EV {r['best_ev']:+.1%}  ¼K {r['kelly'] / 4:.1%}{flag}")
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--date')
+    ap.add_argument('--markets', nargs='+', default=['player_points'], choices=list(PROP_MARKETS))
+    ap.add_argument('--min-ev', type=float, default=MIN_EV)
+    ap.add_argument('--max-events', type=int)
+    ap.add_argument('--no-log', action='store_true')
+    a = ap.parse_args()
+    run(a.date, a.markets, a.min_ev, a.max_events, not a.no_log)
 
 
 if __name__ == '__main__':
-    # Run the pipeline
-    actionable_bets = generate_daily_bets(max_props=50)  # Test with 50 props
+    main()

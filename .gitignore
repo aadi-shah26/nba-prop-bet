@@ -47,7 +47,8 @@ ehthumbs.db
 *.log
 logs/
 
-# Database backups
+# Database (rebuild with: python fetch_game_logs.py)
+*.db
 *.db.backup
 *.db.bak
 

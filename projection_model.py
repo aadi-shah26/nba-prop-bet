@@ -1,444 +1,181 @@
 #!/usr/bin/env python3
 """
-Projection Model with Multi-Stat Support
+Player stat projections -> full probability distribution -> P(over/under/push) for any line.
 
-Step 3: Generate projections for any NBA stat type
-- Points (PTS)
-- Assists (AST)
-- Rebounds (REB)
-- Blocks (BLK)
-- Steals (STL)
-- Combo stats: PRA (Points + Rebounds + Assists), PA, PR, AR, RA
+Stats are counts, so the outcome is modelled as a negative binomial with the projected
+mean and the player's own variance (see feature_engineering.py). That handles low-count
+props (assists 4.5, threes 2.5, blocks 0.5) far better than a normal curve, and gives
+exact push probabilities for whole-number lines.
 
-Each stat type has its own standard deviation for accurate z-score calculations
+Usage:
+    python projection_model.py "shai" PTS                    # projection + fair line + ladder
+    python projection_model.py "shai" PTS --line 30.5 --opp LAL
+    python projection_model.py "jokic" PRA --opp MIN --minutes 30 --date 2026-11-01
 """
 
-from feature_engineering import (
-    get_full_player_features,
-    compute_season_avg_for_stat,
-    compute_last_n_games_for_stat,
-    normalize_player_name
-)
+import argparse
+import math
+
+import pandas as pd
+from scipy import stats as sps
+
+from db import connect, find_players, season_for_date, team_abbr, to_date
+from feature_engineering import (PropParams, STATS, league_priors, opponent_factors,
+                                 parse_stat, project_from_history, team_games_with_allowed)
 
 
-# Standard deviations by stat type (calibrated from historical data)
-STD_DEVS = {
-    'PTS': 5.5,      # Points have highest variance
-    'AST': 2.2,      # Assists have lower variance
-    'REB': 2.8,      # Rebounds have medium-low variance
-    'BLK': 1.1,      # Blocks have very low variance
-    'STL': 0.9,      # Steals have very low variance
-    'PRA': 8.0,      # PTS+REB+AST combo (highest variance)
-    'PA': 6.5,       # PTS+AST combo
-    'PR': 7.0,       # PTS+REB combo
-    'AR': 3.5,       # AST+REB combo
-    'RA': 3.5,       # REB+AST combo (same as AR)
-}
+# ---------------------------------------------------------------------------
+# Distribution
+# ---------------------------------------------------------------------------
+
+def count_distribution(mean, var):
+    """Negative binomial with the given mean/variance (Poisson if var <= mean)."""
+    if var <= mean:
+        return sps.poisson(mean)
+    n = mean ** 2 / (var - mean)
+    return sps.nbinom(n, n / (n + mean))
 
 
-def simple_weighted_projection(season_avg, last10_avg, last5_avg):
-    """
-    Simple projection: 50% season avg, 30% last 10, 20% last 5
-    Weights toward more recent games
-    Works for any stat type
-    """
-    projection = (0.50 * season_avg) + (0.30 * last10_avg) + (0.20 * last5_avg)
-    return round(projection, 2)
-
-
-def advanced_weighted_projection(season_avg, last10_avg, last5_avg, last3_avg):
-    """
-    Advanced projection: 40% season, 35% last10, 15% last5, 10% last3
-    More weight on recent performance
-    Works for any stat type
-    """
-    projection = (0.40 * season_avg) + (0.35 * last10_avg) + (0.15 * last5_avg) + (0.10 * last3_avg)
-    return round(projection, 2)
-
-
-def compute_z_score(projection, line, stat_type='PTS'):
-    """
-    Compute z-score for the projection vs line
-    
-    Uses stat-type specific standard deviation for accurate lean calculation
-    
-    Z-score = (Projection - Line) / Std Dev
-    Tells us how many standard deviations the projection is from the line
-    
-    Positive z-score = OVER lean (projection above line)
-    Negative z-score = UNDER lean (projection below line)
-    """
-    std_dev = STD_DEVS.get(stat_type, 5.5)  # Default to PTS std dev if unknown
-    z_score = (projection - line) / std_dev
-    return round(z_score, 2)
-
-
-def determine_lean(z_score, threshold=0.5):
-    """
-    Determine OVER/UNDER lean based on z-score
-    
-    |z_score| > threshold = Strong lean
-    |z_score| <= threshold = Neutral
-    """
-    if z_score > threshold:
-        return "OVER"
-    elif z_score < -threshold:
-        return "UNDER"
+def line_probs(mean, var, line):
+    """(p_over, p_under, p_push) for an integer-valued stat against `line`."""
+    if mean <= 0:
+        return (0.0, 0.0, 1.0) if line == 0 else (0.0, 1.0, 0.0) if line > 0 else (1.0, 0.0, 0.0)
+    dist = count_distribution(mean, var)
+    fl = math.floor(line)
+    p_over = float(dist.sf(fl))                    # P(X >= floor(line)+1) == P(X > line)
+    if float(line).is_integer():
+        p_push = float(dist.pmf(int(line)))
+        p_under = float(dist.cdf(int(line) - 1))
     else:
-        return "NEUTRAL"
+        p_push = 0.0
+        p_under = float(dist.cdf(fl))
+    return p_over, p_under, p_push
 
 
-def generate_projection(
-    player_name,
-    season,
-    line,
-    stat_type='PTS',
-    opponent=None,
-    model='simple'
-):
+def fair_line(mean, var):
+    """The x.5 line closest to a 50/50 split (what the 'right' book line would be)."""
+    if mean <= 0:
+        return 0.5
+    m = int(count_distribution(mean, var).ppf(0.5))
+    cands = [c for c in (m - 0.5, m + 0.5) if c > 0]
+    return min(cands, key=lambda c: abs(line_probs(mean, var, c)[0] - 0.5))
+
+
+# ---------------------------------------------------------------------------
+# Context: loads data once, projects many props
+# ---------------------------------------------------------------------------
+
+class PropContext:
     """
-    Generate projection for a player stat with line
-    
-    Parameters:
-    -----------
-    player_name : str
-        Player name (case insensitive)
-    season : int
-        NBA season (2025 for 2025-26)
-    line : float
-        Sportsbook line to project against
-    stat_type : str
-        Type of stat: PTS, AST, REB, BLK, STL, PRA, PA, PR, AR, RA
-        Default: 'PTS' (Points)
-    opponent : str, optional
-        Opponent code for matchup adjustment (e.g., 'GSW')
-    model : str
-        'simple' or 'advanced' projection model
-        Default: 'simple' (50/30/20 weights)
-    
-    Returns:
-    --------
-    dict with projection, edge, lean, z-score, and features
-    Returns None if player not found
+    Everything needed to project props for games on `game_date`, using only data from
+    before that date. Build once per run; call .project() for each prop.
     """
-    
-    # Get player features for this stat type
-    features = get_full_player_features(player_name, season, stat_type=stat_type)
-    
-    if features is None:
-        return None
-    
-    season_avg = features['season_avg']
-    last10_avg = features['last10_avg']
-    last5_avg = features['last5_avg']
-    
-    # Generate projection based on model
-    if model == 'advanced':
-        last3_avg = features['last3_avg']
-        projection = advanced_weighted_projection(season_avg, last10_avg, last5_avg, last3_avg)
-    else:
-        projection = simple_weighted_projection(season_avg, last10_avg, last5_avg)
-    
-    # Calculate edge (difference from line)
-    edge = projection - line
-    
-    # Calculate z-score and determine lean
-    z_score = compute_z_score(projection, line, stat_type=stat_type)
-    lean = determine_lean(z_score, threshold=0.5)
-    
-    return {
-        'projection': projection,
-        'line': line,
-        'edge': edge,
-        'z_score': z_score,
-        'lean': lean,
-        'season_avg': season_avg,
-        'last10_avg': last10_avg,
-        'last5_avg': last5_avg,
-        'games_played': features['games_played']
-    }
+
+    def __init__(self, conn, game_date=None, params=None):
+        self.conn = conn
+        self.params = params or PropParams()
+        self.game_date = to_date(game_date).isoformat()
+        self.season = season_for_date(self.game_date)
+        lo = self.season - self.params.lookback_seasons + 1
+        self.player_games = pd.read_sql_query(
+            "SELECT * FROM player_games WHERE season >= ? AND game_date < ? "
+            "ORDER BY game_date, game_id", conn, params=(lo, self.game_date))
+        if self.player_games.empty:
+            raise RuntimeError("No player games in the database before "
+                               f"{self.game_date}. Run: python fetch_game_logs.py")
+        team_games = pd.read_sql_query(
+            "SELECT * FROM team_games WHERE season >= ? AND game_date < ?",
+            conn, params=(lo, self.game_date))
+        self.priors = league_priors(self.player_games)
+        self.tga = team_games_with_allowed(team_games)
+        self.opp = opponent_factors(self.tga, self.game_date, self.season, self.params)
+        self._by_player = {pid: g for pid, g in self.player_games.groupby('player_id', sort=False)}
+        self.last_data_date = self.player_games['game_date'].max()
+
+    def player_history(self, player_id):
+        return self._by_player.get(int(player_id))
+
+    def project(self, player_id, stat, opponent=None, minutes=None):
+        hist = self.player_history(player_id)
+        if hist is None:
+            return None
+        opp = None
+        if opponent:
+            abbr = team_abbr(opponent)
+            if abbr is None:
+                raise ValueError(f"Unknown opponent {opponent!r}")
+            opp = self.opp.get(abbr)
+        res = project_from_history(hist, stat, self.season, self.priors, self.params,
+                                   opp_factor=opp, minutes=minutes)
+        if res is not None:
+            last = hist.iloc[-1]
+            res.update(player_id=int(player_id), player_name=last['player_name'],
+                       team=last['team'], last_game=last['game_date'],
+                       opponent=team_abbr(opponent) if opponent else None,
+                       fair_line=fair_line(res['mean'], res['var']))
+        return res
 
 
-def generate_all_projections(
-    season,
-    stat_type='PTS',
-    custom_lines=None,
-    custom_opponents=None,
-    model='simple'
-):
-    """
-    Generate projections for ALL players in season
-    
-    Parameters:
-    -----------
-    season : int
-        NBA season
-    stat_type : str
-        Type of stat to project (default: 'PTS')
-    custom_lines : dict, optional
-        Custom lines for specific players {player_name: line}
-    custom_opponents : dict, optional
-        Custom opponents for specific players {player_name: opponent}
-    model : str
-        'simple' or 'advanced' projection model
-    
-    Returns:
-    --------
-    List of dicts, one per player with projection data
-    """
-    import sqlite3
-    
-    conn = sqlite3.connect('/Users/aadishah/nba-prop-bet/nba_data.db')
-    cursor = conn.cursor()
-    
-    # Get distinct players
-    cursor.execute('''
-        SELECT DISTINCT player_name
-        FROM game_logs
-        WHERE season = ?
-        ORDER BY player_name
-    ''', (season,))
-    
-    players = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    
-    projections = []
-    for player in players:
-        # Use custom line if provided, otherwise use season average
-        if custom_lines and player in custom_lines:
-            line = custom_lines[player]
-        else:
-            # Use season average as default line
-            avg = compute_season_avg_for_stat(player, season, stat_type)
-            if avg is None:
-                continue
-            line = avg
-        
-        # Get custom opponent if provided
-        opponent = custom_opponents.get(player) if custom_opponents else None
-        
-        # Generate projection
-        proj = generate_projection(player, season, line, stat_type, opponent, model)
-        if proj is not None:
-            projections.append({
-                'player': player,
-                'line': line,
-                **proj
-            })
-    
-    # Sort by edge (biggest OVER edge first)
-    projections.sort(key=lambda x: x['edge'], reverse=True)
-    
-    return projections
+def resolve_player(conn, query, teams=None):
+    """Returns (player_id, player_name, team) or raises LookupError listing candidates."""
+    cands = find_players(conn, query, teams=teams)
+    if cands.empty:
+        raise LookupError(f"No player matches {query!r}")
+    if len(cands) > 1 and cands['norm'].nunique() > 1:
+        names = ', '.join(f"{r.player_name} ({r.team})" for r in cands.head(8).itertuples())
+        raise LookupError(f"{query!r} is ambiguous: {names}")
+    r = cands.iloc[0]
+    return int(r['player_id']), r['player_name'], r['team']
 
 
-def get_latest_season():
-    """Get most recent season in database"""
-    import sqlite3
-    
-    conn = sqlite3.connect('/Users/aadishah/nba-prop-bet/nba_data.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT MAX(season) FROM game_logs')
-    season = cursor.fetchone()[0]
-    conn.close()
-    
-    return season if season else 2025
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def print_projection(p, line=None):
+    stat = p['stat']
+    print(f"\n{'=' * 64}")
+    print(f"📊 {p['player_name']} ({p['team']}) — {stat}"
+          + (f" vs {p['opponent']}" if p['opponent'] else ''))
+    print(f"{'=' * 64}")
+    print(f"Projection (mean):  {p['mean']:.2f}   sd {p['sd']:.2f}")
+    print(f"Fair line:          {p['fair_line']}")
+    print(f"Minutes:            {p['minutes_proj']:.1f}"
+          + ('' if abs(p['minutes_proj'] - p['minutes_hist']) < 1e-9
+             else f"  (override; recent avg {p['minutes_hist']:.1f})"))
+    opp = ', '.join(f"{c} x{f:.3f}" for c, f in p['opp_factors'].items())
+    print(f"Opponent factors:   {opp}")
+    sa = f"{p['season_avg']:.2f} ({p['season_games']} g)" if p['season_avg'] is not None else 'n/a'
+    print(f"Season avg:         {sa}   last10 {p['last10_avg']:.2f}   last5 {p['last5_avg']:.2f}")
+    print(f"Data through:       {p['last_game']}  ({p['games_used']} games used)")
+    lines = [line] if line is not None else \
+        [p['fair_line'] + d for d in (-3, -2, -1, 0, 1, 2, 3) if p['fair_line'] + d > 0]
+    print(f"\n{'Line':>7} {'P(over)':>9} {'P(under)':>9} {'P(push)':>8}")
+    for L in lines:
+        o, u, ps = line_probs(p['mean'], p['var'], L)
+        print(f"{L:>7} {o:>9.1%} {u:>9.1%} {ps:>8.1%}")
+    print()
 
 
-def interactive_test():
-    """Interactive mode to test projections for any player and stat type"""
-    from feature_engineering import get_all_players, normalize_player_name
-    
-    season = get_latest_season()
-    
-    print(f"\n{'='*70}")
-    print(f"🏀 INTERACTIVE PROJECTION TESTER")
-    print(f"{'='*70}")
-    print(f"Season: {season}\n")
-    print(f"Available stats: PTS, AST, REB, PRA, PA, PR, AR\n")
-    
-    all_players = get_all_players(season)
-    
-    while True:
-        try:
-            # STEP 1: Get and validate player name
-            player_input = input("Enter player name (or 'quit' to exit): ").strip()
-            if player_input.lower() == 'quit':
-                break
-            
-            # Check if player exists (case-insensitive)
-            player = normalize_player_name(player_input)
-            if player is None:
-                print(f"❌ Player '{player_input}' not found")
-                # Show similar names
-                similar = [p for p in all_players if player_input.lower() in p.lower()]
-                if similar:
-                    print(f"   Did you mean? {', '.join(similar[:5])}")
-                else:
-                    print(f"   Available: {', '.join(all_players[:10])}...")
-                print()
-                continue
-            
-            print(f"✅ Found: {player}\n")
-            
-            # STEP 2: Get stat type
-            stat_type = input("Enter stat type (PTS/AST/REB/PRA/PA/PR/AR): ").strip().upper()
-            if not stat_type:
-                stat_type = 'PTS'
-            if stat_type not in ['PTS', 'AST', 'REB', 'PRA', 'PA', 'PR', 'AR']:
-                print(f"❌ Invalid stat type. Use: PTS, AST, REB, PRA, PA, PR, AR\n")
-                continue
-            
-            # STEP 3: Get line
-            line = float(input("Enter line (or press Enter for season average): ").strip() or '0')
-            
-            # If no line provided, use season average
-            if line == 0:
-                line = compute_season_avg_for_stat(player, season, stat_type)
-                if line is None:
-                    print(f"❌ Could not compute season average\n")
-                    continue
-                print(f"   (Using season average: {line:.2f})")
-            
-            # STEP 4: Get opponent (optional)
-            opponent = input("Enter opponent (optional, press Enter for none): ").strip() or None
-            
-            # Generate projection
-            projection_data = generate_projection(
-                player_name=player,
-                season=season,
-                line=line,
-                stat_type=stat_type,
-                opponent=opponent,
-                model='simple'
-            )
-            
-            if projection_data is None:
-                print(f"❌ Could not generate projection\n")
-                continue
-            
-            # Print results
-            print(f"\n{'='*70}")
-            print(f"📊 PROJECTION FOR {player.upper()}")
-            print(f"{'='*70}")
-            print(f"Stat Type:         {stat_type}")
-            print(f"Line:              {projection_data['line']:.1f} {stat_type}")
-            print(f"Projection:        {projection_data['projection']:.2f} {stat_type}")
-            print(f"Edge:              {projection_data['edge']:+.2f} {stat_type}")
-            print(f"Lean:              {projection_data['lean']}")
-            print(f"Z-Score:           {projection_data['z_score']:.2f}σ")
-            print(f"\nSeason Stats:")
-            print(f"  Season Avg:      {projection_data['season_avg']:.2f} {stat_type}")
-            print(f"  Last 10 Avg:     {projection_data['last10_avg']:.2f} {stat_type}")
-            print(f"  Last 5 Avg:      {projection_data['last5_avg']:.2f} {stat_type}")
-            print(f"  Games Played:    {projection_data['games_played']}")
-            print(f"{'='*70}\n")
-        
-        except ValueError as e:
-            print(f"❌ Invalid input: {e}\n")
-        except Exception as e:
-            print(f"❌ Error: {e}\n")
-            print(f"Line:              {projection_data['line']:.1f} {stat_type}")
-            print(f"Projection:        {projection_data['projection']:.2f} {stat_type}")
-            print(f"Edge:              {projection_data['edge']:+.2f} {stat_type}")
-            print(f"Lean:              {projection_data['lean']}")
-            print(f"Z-Score:           {projection_data['z_score']:.2f}σ")
-            print(f"\nSeason Stats:")
-            print(f"  Season Avg:      {projection_data['season_avg']:.2f} {stat_type}")
-            print(f"  Last 10 Avg:     {projection_data['last10_avg']:.2f} {stat_type}")
-            print(f"  Last 5 Avg:      {projection_data['last5_avg']:.2f} {stat_type}")
-            print(f"  Games Played:    {projection_data['games_played']}")
-            print(f"{'='*70}\n")
-        
-        except ValueError as e:
-            print(f"❌ Invalid input: {e}")
-        except Exception as e:
-            print(f"❌ Error: {e}")
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('player')
+    ap.add_argument('stat', help=', '.join(STATS))
+    ap.add_argument('--line', type=float)
+    ap.add_argument('--opp', help='opponent team (abbr or name)')
+    ap.add_argument('--minutes', type=float, help='override projected minutes')
+    ap.add_argument('--date', help='game date YYYY-MM-DD (default today)')
+    a = ap.parse_args()
 
-
-def test_projections():
-    """Run comprehensive tests for multi-stat projections"""
-    
-    season = get_latest_season()
-    print(f"\n{'='*80}")
-    print(f"🧪 MULTI-STAT PROJECTION TESTS")
-    print(f"{'='*80}")
-    print(f"Season: {season}\n")
-    
-    # TEST 1: Shai for all stat types
-    print(f"\n{'='*70}")
-    print(f"TEST 1: Shai Gilgeous-Alexander - All Stat Types")
-    print(f"{'='*70}\n")
-    
-    shai_tests = ['PTS', 'AST', 'REB', 'PRA']  # Only stats in database
-    for stat in shai_tests:
-        proj = generate_projection('Shai Gilgeous-Alexander', season, 50.5, stat_type=stat)
-        if proj:
-            print(f"{stat:6} | Line: {proj['line']:6.1f} | Proj: {proj['projection']:6.2f} | "
-                  f"Edge: {proj['edge']:+6.2f} | Z-Score: {proj['z_score']:+5.2f}σ | Lean: {proj['lean']:<8}")
-        else:
-            print(f"{stat:6} | NOT FOUND")
-    
-    # TEST 2: Different players for PTS
-    print(f"\n{'='*70}")
-    print(f"TEST 2: Multiple Players - Points (PTS)")
-    print(f"{'='*70}\n")
-    
-    players = ['LeBron James', 'Stephen Curry', 'Jalen Johnson']
-    for player in players:
-        proj = generate_projection(player, season, 25.5, stat_type='PTS')
-        if proj:
-            print(f"{player:<25} | Proj: {proj['projection']:6.2f} | Edge: {proj['edge']:+6.2f} | "
-                  f"Lean: {proj['lean']:<8}")
-        else:
-            print(f"{player:<25} | NOT FOUND")
-    
-    # TEST 3: Different players for AST
-    print(f"\n{'='*70}")
-    print(f"TEST 3: Multiple Players - Assists (AST)")
-    print(f"{'='*70}\n")
-    
-    for player in players:
-        proj = generate_projection(player, season, 5.5, stat_type='AST')
-        if proj:
-            print(f"{player:<25} | Proj: {proj['projection']:6.2f} | Edge: {proj['edge']:+6.2f} | "
-                  f"Lean: {proj['lean']:<8}")
-        else:
-            print(f"{player:<25} | NOT FOUND")
-    
-    # TEST 4: Combo stat - PRA
-    print(f"\n{'='*70}")
-    print(f"TEST 4: Multiple Players - Combo (PRA = PTS + REB + AST)")
-    print(f"{'='*70}\n")
-    
-    for player in players:
-        proj = generate_projection(player, season, 50.5, stat_type='PRA')
-        if proj:
-            print(f"{player:<25} | Proj: {proj['projection']:6.2f} | Edge: {proj['edge']:+6.2f} | "
-                  f"Lean: {proj['lean']:<8}")
-        else:
-            print(f"{player:<25} | NOT FOUND")
-    
-    # TEST 5: Rebounds with line variations
-    print(f"\n{'='*70}")
-    print(f"TEST 5: Multiple Players - Rebounds (REB) with Different Lines")
-    print(f"{'='*70}\n")
-    
-    for player in players:
-        for line in [5.5, 7.5, 9.5]:
-            proj = generate_projection(player, season, line, stat_type='REB')
-            if proj:
-                print(f"  {player:<23} REB {line:4.1f} | Proj: {proj['projection']:5.2f} | Lean: {proj['lean']:<8}")
-    
-    print(f"\n{'='*80}")
-    print(f"✅ All tests complete!")
-    print(f"{'='*80}\n")
+    conn = connect()
+    pid, name, team = resolve_player(conn, a.player)
+    ctx = PropContext(conn, a.date)
+    p = ctx.project(pid, parse_stat(a.stat), opponent=a.opp, minutes=a.minutes)
+    if p is None:
+        print(f"❌ Not enough recent games for {name}")
+        return
+    print_projection(p, a.line)
 
 
 if __name__ == '__main__':
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == 'interactive':
-        interactive_test()
-    else:
-        test_projections()
+    main()

@@ -1,58 +1,44 @@
 #!/usr/bin/env python3
 """
-Daily update script
-Run this daily via cron to keep game logs fresh
+Daily maintenance (run once a day, e.g. via cron, after the previous night's games):
+  1. refresh the current season's player and team game logs (4-6 API requests)
+  2. settle logged props and game bets against actual results
+  3. re-calibrate the game model's margin/total SDs
+
+    python daily_update.py
 """
 
-import sys
-import sqlite3
-from fetch_game_logs import update_daily_logs
 from datetime import datetime
 
+from bet_signals import settle_props
+from db import connect, init_db, season_for_date, season_str
+from fetch_game_logs import ingest_season
+from game_model import calibrate, settle_games
+
+
 def main():
-    print(f"\n{'='*50}")
-    print(f"NBA Game Logs Daily Update")
-    print(f"Timestamp: {datetime.now().isoformat()}")
-    print(f"{'='*50}\n")
-    
-    # Update daily
-    update_daily_logs()
-    
-    # Show last update stats
-    conn = sqlite3.connect('nba_data.db')
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM game_logs")
-    total_games = cursor.fetchone()[0]
-    
-    # Get ALL game dates and find the latest chronologically
-    cursor.execute("SELECT DISTINCT game_date FROM game_logs")
-    all_dates = cursor.fetchall()
-    
-    # Parse dates properly to find latest
-    from datetime import datetime as dt
-    latest_date = None
-    date_format = "%b %d, %Y"  # "Apr 09, 2026"
-    
-    for (date_str,) in all_dates:
-        try:
-            parsed_date = dt.strptime(date_str, date_format)
-            if latest_date is None or parsed_date > latest_date:
-                latest_date = parsed_date
-        except:
-            pass
-    
-    conn.close()
-    
-    print(f"\n📊 Database Stats:")
-    print(f"   Total games stored: {total_games}")
-    if latest_date:
-        print(f"   Latest game date: {latest_date.strftime('%B %d, %Y')}")
-        days_old = (datetime.now() - latest_date).days
-        print(f"   Data is {days_old} days old")
-    else:
-        print(f"   Latest game date: Unknown")
-    print(f"\n✅ Update finished at {datetime.now().isoformat()}\n")
+    print(f"\n{'=' * 50}\nNBA daily update — {datetime.now().isoformat(timespec='seconds')}\n{'=' * 50}")
+    conn = connect()
+    init_db(conn)
+    if conn.execute("SELECT COUNT(*) FROM team_games").fetchone()[0] == 0:
+        print("Database is empty — run python fetch_game_logs.py first (loads 3 seasons).")
+        return
+
+    season = season_for_date(None)
+    print(f"🔄 Refreshing {season_str(season)}")
+    ingest_season(conn, season)
+
+    n_p, n_g = settle_props(conn), settle_games(conn)
+    print(f"🧾 Settled {n_p} props, {n_g} game bets")
+
+    cal = calibrate(conn)
+    if cal:
+        print(f"📐 Game model SDs: margin {cal[0]:.2f}, total {cal[1]:.2f} (from {cal[2]} games)")
+
+    n = conn.execute("SELECT COUNT(*) FROM player_games").fetchone()[0]
+    last = conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
+    days = (datetime.now().date() - datetime.fromisoformat(last).date()).days
+    print(f"\n📊 {n} player-games; latest game {last} ({days} days ago)\n")
 
 
 if __name__ == '__main__':
