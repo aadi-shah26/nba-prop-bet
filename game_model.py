@@ -19,7 +19,6 @@ Usage:
     python game_model.py --home BOS --away LAL
     python game_model.py --home BOS --away LAL --spread -5.5 --spread-odds -110 -110 \
                          --total 221.5 --total-odds -110 -110 --ml -230 +190
-    python game_model.py --slate            # today's games + free Odds API lines
 """
 
 import argparse
@@ -321,9 +320,23 @@ def evaluate_markets(pred, spread=None, spread_odds=None, total=None, total_odds
     out = []
     for market, line, oa, ob, pa, pb, fair, ea, eb, pick in res:
         k = kelly_fraction(pa, pb, oa) if pick == 'A' else kelly_fraction(pb, pa, ob) if pick == 'B' else 0
+        p_np = pa / (pa + pb) if pa + pb > 0 else 0.5
+        warning = None
+        if abs(p_np - fair) > DISAGREE_WARN:
+            warning = (f"Model and market differ by {abs(p_np - fair):.0%}. Game lines are sharp: this "
+                       "almost always means injuries/rest the model can't see. Check news first.")
         out.append({'market': market, 'line': line, 'odds_a': oa, 'odds_b': ob, 'p_a': pa, 'p_b': pb,
-                    'fair_a': fair, 'ev_a': ea, 'ev_b': eb, 'pick': pick, 'kelly': k})
+                    'fair_a': fair, 'ev_a': ea, 'ev_b': eb, 'pick': pick, 'kelly': k,
+                    'warning': warning})
     return out
+
+
+def stale_warning(ctx):
+    days_old = (to_date(ctx.game_date) - to_date(ctx.ratings['last_game'])).days
+    if days_old > 4:
+        return (f"Ratings use games through {ctx.ratings['last_game']} ({days_old} days before this game). "
+                "Update the data.")
+    return None
 
 
 def log_game_evals(conn, game_date, pred, evals, book=None):
@@ -395,14 +408,10 @@ def print_game(pred, ctx, evals):
         pick = 'PASS' if e['pick'] == 'PASS' else (a if e['pick'] == 'A' else b)
         extra = f"  (¼-Kelly stake {e['kelly'] / 4:.1%} of bankroll)" if e['pick'] != 'PASS' else ''
         print(f"    ➜ {pick}{extra}")
-        p_np = e['p_a'] / (e['p_a'] + e['p_b']) if e['p_a'] + e['p_b'] > 0 else 0.5
-        if abs(p_np - e['fair_a']) > DISAGREE_WARN:
-            print(f"    ⚠️  Model and market differ by {abs(p_np - e['fair_a']):.0%}. Game lines are sharp: "
-                  "this almost always means injuries/rest the model can't see. Check news first.")
-    days_old = (to_date(ctx.game_date) - to_date(ctx.ratings['last_game'])).days
-    if days_old > 4:
-        print(f"⚠️  Ratings use games through {ctx.ratings['last_game']} ({days_old} days old). "
-              "Run python daily_update.py.")
+        if e['warning']:
+            print(f"    ⚠️  {e['warning']}")
+    if stale_warning(ctx):
+        print(f"⚠️  {stale_warning(ctx)}")
     print()
 
 
@@ -423,30 +432,12 @@ def main():
     ap.add_argument('--total-odds', type=int, nargs=2, default=[-110, -110], metavar=('OVER', 'UNDER'))
     ap.add_argument('--ml', type=int, nargs=2, metavar=('HOME', 'AWAY'), help='moneyline odds')
     ap.add_argument('--min-ev', type=float, default=0.03)
-    ap.add_argument('--slate', action='store_true', help="evaluate today's games with Odds API lines")
-    ap.add_argument('--book', default='draftkings', help='bookmaker key for --slate')
     ap.add_argument('--no-log', action='store_true', help="don't write evaluations to game_log")
     a = ap.parse_args()
 
     conn = connect()
-    if a.slate:
-        from odds_fetcher import fetch_game_lines
-        lines = fetch_game_lines(book=a.book, date=a.date)
-        if not lines:
-            print("No games found for that date/book.")
-            return
-        ctx = GameContext(conn, lines[0]['game_date'])
-        for g in lines:
-            pred = ctx.evaluate(g['home'], g['away'], g.get('spread'), g.get('total'))
-            evals = evaluate_markets(pred, g.get('spread'), g.get('spread_odds'), g.get('total'),
-                                     g.get('total_odds'), g.get('ml'), a.min_ev)
-            print_game(pred, ctx, evals)
-            if not a.no_log:
-                log_game_evals(conn, ctx.game_date, pred, evals, a.book)
-        return
-
     if not (a.home and a.away):
-        ap.error('--home and --away are required (or use --slate)')
+        ap.error('--home and --away are required')
     ctx = GameContext(conn, a.date)
     pred = ctx.evaluate(a.home, a.away, a.spread, a.total)
     evals = evaluate_markets(pred, a.spread, a.spread_odds if a.spread is not None else None,

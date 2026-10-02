@@ -35,7 +35,7 @@ _STAT_MAP = {'PTS': 'pts', 'REB': 'reb', 'AST': 'ast', 'STL': 'stl', 'BLK': 'blk
              'OREB': 'oreb', 'DREB': 'dreb', 'PF': 'pf'}
 
 
-def fetch_league_log(season, season_type, kind, retries=4, timeout=60):
+def fetch_league_log(season, season_type, kind, retries=4, timeout=60, log=print):
     """
     kind: 'P' (player rows) or 'T' (team rows). Returns a DataFrame (empty if the
     season/season type has no games yet). Raises after `retries` failed attempts so a
@@ -55,7 +55,7 @@ def fetch_league_log(season, season_type, kind, retries=4, timeout=60):
         except Exception as e:  # network errors, JSON decode errors from rate limiting, ...
             last_err = e
             wait = 2 ** (attempt + 1)
-            print(f"  ⚠️  {season_str(season)} {season_type} {kind}: {type(e).__name__}; retry in {wait}s")
+            log(f"⚠️ {season_str(season)} {season_type} {kind}: {type(e).__name__}; retry in {wait}s")
             time.sleep(wait)
     raise RuntimeError(f"Failed to fetch {season_str(season)} {season_type} {kind}: {last_err}")
 
@@ -144,21 +144,21 @@ def ingest_frames(conn, season, season_type, player_raw, team_raw):
     return upsert(conn, 'player_games', p, PLAYER_COLS), upsert(conn, 'team_games', t, TEAM_COLS)
 
 
-def ingest_season(conn, season, season_types=SEASON_TYPES, pause=1.0):
+def ingest_season(conn, season, season_types=SEASON_TYPES, pause=1.0, log=print):
     total_p = total_t = 0
     for st in season_types:
         try:
-            p_raw = fetch_league_log(season, st, 'P')
+            p_raw = fetch_league_log(season, st, 'P', log=log)
             time.sleep(pause)
-            t_raw = fetch_league_log(season, st, 'T')
+            t_raw = fetch_league_log(season, st, 'T', log=log)
             time.sleep(pause)
         except RuntimeError as e:
             if st == 'PlayIn':  # a handful of games; not worth failing the whole run over
-                print(f"  ⚠️  Skipping play-in games: {e}")
+                log(f"⚠️ Skipping play-in games: {e}")
                 continue
             raise
         n_p, n_t = ingest_frames(conn, season, st, p_raw, t_raw)
-        print(f"  ✅ {season_str(season)} {st:<14} {n_p:>6} player-games, {n_t:>5} team-games")
+        log(f"✅ {season_str(season)} {st:<14} {n_p:>6} player-games, {n_t:>5} team-games")
         total_p += n_p
         total_t += n_t
     return total_p, total_t

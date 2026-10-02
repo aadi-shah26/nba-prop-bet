@@ -1,90 +1,65 @@
 # 🏀 NBA Prop & Game Model
 
-Pulls every NBA player and team box score for the last 3 seasons, projects any player stat as a
-full probability distribution, and tells you whether a line you enter is an **OVER, UNDER or
-PASS** — with real expected value against the bookmaker's no-vig price. A team-rating model
-does the same for **spreads, totals and moneylines**. Every evaluation is logged and settled
-automatically, so you can measure whether the model actually beats the market.
+A local web app: pick a player or a game, type in the line and prices from your sportsbook,
+and it tells you **OVER / UNDER / PASS** (or which side of a spread/total/moneyline) with the
+expected value behind it. Projections come from every NBA player and team box score of the
+last 3 seasons. Everything you evaluate is logged and settled automatically, so you can see
+whether the model actually beats the market.
 
-No paid data is required. The Odds API is optional (free tier covers game lines and a few
-prop markets per day).
+No paid data, no API keys.
 
-## Setup
+## Start it
 
+**Mac:** double-click `start.command`. The first run installs the requirements; then the app
+opens in your browser. (Closing the Terminal window it opens stops the app.)
+
+**Any OS:**
 ```bash
 pip install -r requirements.txt
-python fetch_game_logs.py          # one-time: last 3 seasons, ~6 requests to stats.nba.com
-python daily_update.py             # every day: refresh, settle logged bets, recalibrate
+streamlit run app.py
 ```
 
-Optional, for live lines: put `ODDS_API_KEY=...` in a `.env` file.
+First time: press **🔄 Update data** in the sidebar. It downloads 3 seasons from stats.nba.com
+(about a minute). After that, press it once a day — it adds last night's games, settles your
+logged bets, and recalibrates the game model.
 
-The database (`nba_data.db`) is not committed — `fetch_game_logs.py` rebuilds it in about a
-minute.
+## Using it
 
-## Daily use
+**🎯 Player prop** — choose the player (type to search), the stat, the line, both prices
+(default -110 / -110), optionally the opponent and the game date. You get:
 
-### Props — you enter the line
+* the verdict: **BET OVER/UNDER** with EV and a ¼-Kelly stake size, or **PASS**
+* **Model** probability vs **Market (no vig)** probability for each side, and EV per $1
+* projection, fair line (where over/under would be 50/50), projected minutes, season average
+* a chart of the full outcome distribution, coloured by over/under
+* warnings when the model is probably missing something (big disagreement with the market,
+  stale data, early-season sample, low-minutes player)
+
+Use **Minutes (optional)** when you know something the model doesn't — a minutes limit, or a
+starter out who will push this player's minutes up.
+
+Stats: points, rebounds, assists, 3-pointers made, PRA, PR, PA, RA, steals, blocks,
+steals+blocks, turnovers.
+
+**🏀 Game** — choose away and home team. Leave the lines blank to just get the predicted
+score and win probability, or fill in any of spread (the **home** team's line), total and
+moneyline to get a pick for each.
+
+**📒 My results** — record, profit, ROI and the model-vs-market Brier score on everything
+you've logged, plus the full log. **This is the real test of edge.** Without free historical
+lines nobody can backtest profit, so give it a few hundred logged props before trusting it.
+
+The sidebar has the minimum EV to bet (default 3%) and a switch to stop saving evaluations.
+
+### Terminal versions (optional)
 
 ```bash
-python bet_signals.py                                         # interactive
 python bet_signals.py "shai" PTS 31.5 --over -115 --under -105 --opp LAL
-python bet_signals.py "jokic" PRA 52.5 --opp MIN --minutes 30   # known minutes limit
-```
-
-```
-🎯 Shai Gilgeous-Alexander (OKC) PTS 31.5 vs LAL   [2024-03-01]
-Projection:   30.92 ± 7.78    fair line 30.5    minutes 34.2
-          odds    model   market       EV
-OVER      -115    44.5%    51.1%   -16.7%
-UNDER     -105    55.5%    48.9%    +8.3%
-➜ BET UNDER   ¼-Kelly stake: 2.2% of bankroll
-```
-
-* **model** — probability from the player's projected distribution (pushes handled exactly on whole-number lines)
-* **market** — the book's probability with its margin removed (needs both prices; default -110/-110)
-* **EV** — expected profit per $1 at the offered price
-* Bets only when EV ≥ +3% (`--min-ev`). Warnings flag likely missing information (big
-  model/market disagreement, stale data, small samples, low-minute players).
-
-Stats: `PTS REB AST STL BLK TOV FG3M PRA PR PA RA SB` (aliases like `3PM`, `P+R+A` work).
-
-### What should the line be?
-
-```bash
-python projection_model.py "shai" PTS --opp LAL     # projection, fair line, P(over) ladder
-```
-
-### Games — score prediction, spreads, totals
-
-```bash
-python game_model.py --home BOS --away LAL                          # predicted score + win prob
+python projection_model.py "shai" PTS --opp LAL         # fair line + probability ladder
 python game_model.py --home BOS --away LAL --spread -5.5 --total 221.5 --ml -230 +190
-python game_model.py --slate                                        # today's games, Odds API lines (3 credits)
-```
-
-`--spread` is always the **home** team's line.
-
-### Automated props from The Odds API
-
-```bash
-python generate_daily_bets.py                                       # player_points, all US books
-python generate_daily_bets.py --markets player_points player_rebounds --max-events 3
-```
-
-Props cost **1 credit per market per game** (all US books are included in that, so the best
-price across books is found for free). A 10-game night with one market ≈ 10 credits. Output
-goes to `daily_bets/props_<date>.csv` and the log.
-
-### How am I doing?
-
-```bash
 python bet_signals.py --report
+python daily_update.py                                   # same as the Update data button
 ```
-
-Record, ROI and — most importantly — whether the model's probabilities beat the market's
-no-vig probabilities (Brier score) on everything you've logged. **This is the only real test of
-edge**; the backtest below can't use historical lines because none are freely available.
 
 ## How the models work
 
@@ -159,15 +134,15 @@ and rest (projections lag sudden role changes — April is the weakest month), t
 
 | File | Purpose |
 |---|---|
+| `app.py`, `start.command` | The web app and its Mac launcher |
 | `fetch_game_logs.py` | League-wide player + team game logs from stats.nba.com |
 | `daily_update.py` | Refresh current season, settle logged bets, recalibrate game model |
 | `feature_engineering.py` | Shared numeric core (rates, minutes, opponent factors, dispersion) |
 | `projection_model.py` | Distributions, fair lines, projection CLI |
 | `bet_signals.py` | Prop evaluator, prop log, settlement, report |
+| `tracking.py` | Performance summaries for the Results tab and report |
 | `game_model.py` | Team ratings, score/spread/total/moneyline model |
 | `odds.py` | American odds, no-vig, EV, Kelly |
-| `odds_fetcher.py` | The Odds API client (props via per-event endpoint, game lines) |
-| `generate_daily_bets.py` | Automated prop slate from The Odds API |
 | `backtest.py` | Walk-forward backtests and parameter tuning |
 | `db.py`, `schema.sql` | Database, season helpers, player/team name matching |
 | `tests/` | `python -m pytest tests` |

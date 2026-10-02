@@ -19,11 +19,10 @@ Usage:
 import argparse
 from datetime import datetime, timezone
 
-import pandas as pd
 
 from db import connect, find_players, init_db, to_date
 from feature_engineering import STATS, parse_stat
-from odds import american_to_decimal, decide, kelly_fraction, no_vig_probs
+from odds import decide, kelly_fraction, no_vig_probs
 from projection_model import PropContext, line_probs
 
 MIN_EV = 0.03            # don't bet below +3% EV: model error eats thinner edges
@@ -138,38 +137,21 @@ def settle_props(conn):
 
 
 def report(conn):
-    df = pd.read_sql_query("SELECT * FROM prop_log WHERE result IS NOT NULL", conn)
-    print(f"\n{'=' * 70}\n📒 PROP LOG REPORT\n{'=' * 70}")
-    total = conn.execute("SELECT COUNT(*) FROM prop_log").fetchone()[0]
-    print(f"Logged: {total}   settled: {len(df)}")
-    if df.empty:
-        print("Nothing settled yet. Run python daily_update.py after games finish.\n")
-        return
-    bets = df[df['pick'].isin(['OVER', 'UNDER']) & df['result'].isin(['WIN', 'LOSS', 'PUSH'])].copy()
-    if len(bets):
-        odds = bets.apply(lambda r: r['over_odds'] if r['pick'] == 'OVER' else r['under_odds'], axis=1)
-        dec = odds.map(american_to_decimal)
-        profit = (bets['result'] == 'WIN') * (dec - 1) - (bets['result'] == 'LOSS') * 1.0
-        claimed = bets.apply(lambda r: r['ev_over'] if r['pick'] == 'OVER' else r['ev_under'], axis=1)
-        w, l, p = [(bets['result'] == x).sum() for x in ('WIN', 'LOSS', 'PUSH')]
-        print(f"\nPicks: {len(bets)}   {w}-{l}-{p}   profit {profit.sum():+.2f}u   ROI {profit.mean():+.1%}   "
-              f"(model claimed avg EV {claimed.mean():+.1%})")
-        print("   A real edge needs a few hundred picks to show up; under ~100 this is mostly noise.")
-    # Calibration on every settled, non-push, non-DNP prop (picked or not)
-    c = df[df['actual'].notna()].copy()
-    c = c[c['actual'] != c['line']]
-    if len(c) >= 20:
-        c['p'] = c['p_over'] / (c['p_over'] + c['p_under'])
-        c['hit'] = (c['actual'] > c['line']).astype(float)
-        brier_model = ((c['p'] - c['hit']) ** 2).mean()
-        brier_mkt = ((c['fair_over'] - c['hit']) ** 2).mean()
-        print(f"\nCalibration on {len(c)} settled props: Brier model {brier_model:.4f} vs market "
-              f"{brier_mkt:.4f}  ({'model better' if brier_model < brier_mkt else 'market better'})")
-        cut = pd.cut(c['p'], [0, .3, .4, .45, .5, .55, .6, .7, 1])
-        print(c.groupby(cut, observed=True).agg(n=('hit', 'size'), model=('p', 'mean'),
-                                                market=('fair_over', 'mean'), actual=('hit', 'mean'))
-              .to_string(float_format=lambda x: f'{x:.3f}'))
-    print()
+    from tracking import game_summary, prop_summary
+    print(f"\n{'=' * 70}\n📒 PERFORMANCE REPORT\n{'=' * 70}")
+    for label, summ in (('Props', prop_summary(conn)), ('Game lines', game_summary(conn))):
+        print(f"\n{label}: logged {summ['logged']}, settled {summ['settled']}")
+        r = summ['record']
+        if r:
+            print(f"  Picks: {r['picks']}   {r['wins']}-{r['losses']}-{r['pushes']}   profit {r['profit']:+.2f}u"
+                  f"   ROI {r['roi']:+.1%}   (model claimed avg EV {r['claimed_ev']:+.1%})")
+        cal = summ.get('calibration')
+        if cal and cal['n'] >= 20:
+            better = 'model better' if cal['brier_model'] < cal['brier_market'] else 'market better'
+            print(f"  Calibration on {cal['n']} settled props: Brier model {cal['brier_model']:.4f} vs "
+                  f"market {cal['brier_market']:.4f} ({better})")
+            print(cal['table'].to_string(index=False, float_format=lambda x: f'{x:.3f}'))
+    print("\nA real edge needs a few hundred picks to show up; under ~100 this is mostly noise.\n")
 
 
 # ---------------------------------------------------------------------------

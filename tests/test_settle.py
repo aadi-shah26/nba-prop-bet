@@ -67,7 +67,7 @@ def test_game_log_dedup_without_book(league_conn):
     d, home, away = _game(league_conn)
     ctx = GameContext(league_conn, d)
     pred = ctx.evaluate(home, away, spread=-2.5)
-    evals = evaluate_markets(pred, -2.5, (-110, -110))
+    evals = evaluate_markets(pred, -2.5, (-110, -110), ml=(-150, 130))   # moneyline has line NULL
     log_game_evals(league_conn, d, pred, evals)
     log_game_evals(league_conn, d, pred, evals)
-    assert league_conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 1
+    assert league_conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 2

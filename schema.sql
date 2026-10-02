@@ -114,3 +114,11 @@ CREATE TABLE IF NOT EXISTS model_params (
     value      REAL NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- game_log's UNIQUE constraint can't dedupe moneylines (line IS NULL) or rows without a book,
+-- because SQLite treats NULLs as distinct. This index treats them as values.
+DELETE FROM game_log WHERE id NOT IN (
+    SELECT MIN(id) FROM game_log
+    GROUP BY game_date, home, away, market, IFNULL(line, 'ML'), odds_a, odds_b, IFNULL(book, ''));
+CREATE UNIQUE INDEX IF NOT EXISTS ux_game_log_dedup ON game_log
+    (game_date, home, away, market, IFNULL(line, 'ML'), odds_a, odds_b, IFNULL(book, ''));
