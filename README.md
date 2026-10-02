@@ -6,7 +6,6 @@ expected value behind it. Projections come from every NBA player and team box sc
 last 3 seasons. Everything you evaluate is logged and settled automatically, so you can see
 whether the model actually beats the market.
 
-No paid data, no API keys.
 
 ## Start it
 
