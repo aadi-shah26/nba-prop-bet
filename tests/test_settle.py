@@ -71,3 +71,13 @@ def test_game_log_dedup_without_book(league_conn):
     log_game_evals(league_conn, d, pred, evals)
     log_game_evals(league_conn, d, pred, evals)
     assert league_conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 2
+
+
+def test_neutral_site_game_settles(league_conn):
+    d, home, away = _game(league_conn)
+    league_conn.execute("UPDATE team_games SET home = 0 WHERE game_date = ?", (d,))
+    ctx = GameContext(league_conn, d)
+    pred = ctx.evaluate(home, away, total=200.5)
+    log_game_evals(league_conn, d, pred, evaluate_markets(pred, total=200.5, total_odds=(-110, -110),
+                                                         min_ev=-1.0))
+    assert settle_games(league_conn) == 1

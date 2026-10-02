@@ -48,11 +48,35 @@ def test_ingest_iso_dates_and_counts(conn):
     assert conn.execute('SELECT COUNT(*) FROM player_games').fetchone()[0] == len(p)
 
 
-def test_ingest_rejects_broken_game(conn):
-    _, t = make_league(seasons=(2025,))[2025]
+def test_incomplete_game_skipped(conn):
+    p, t = make_league(seasons=(2025,))[2025]
+    first = t['GAME_ID'].iloc[0]
     broken = t.iloc[1:]  # first game now has only one team row
-    with pytest.raises(ValueError):
-        ingest_frames(conn, 2025, 'Regular Season', pd.DataFrame(), broken)
+    msgs = []
+    n_p, n_t = ingest_frames(conn, 2025, 'Regular Season', p, broken, log=msgs.append)
+    assert n_t == len(t) - 2 and n_p == len(p)
+    assert conn.execute("SELECT COUNT(*) FROM team_games WHERE game_id = ?", (first,)).fetchone()[0] == 0
+    assert any('only one team row' in m for m in msgs)
+
+
+def test_neutral_site_game(conn):
+    """e.g. NBA Cup final: both rows listed as 'vs.' -> stored with no home team."""
+    p, t = make_league(seasons=(2025,))[2025]
+    g = t['GAME_ID'].iloc[0]
+    t = t.copy()
+    p = p.copy()
+    away_row = (t['GAME_ID'] == g) & t['MATCHUP'].str.contains('@')
+    t.loc[away_row, 'MATCHUP'] = t.loc[away_row, 'MATCHUP'].str.replace('@', 'vs.')
+    msgs = []
+    ingest_frames(conn, 2025, 'Regular Season', p, t, log=msgs.append)
+    homes = [r[0] for r in conn.execute("SELECT home FROM team_games WHERE game_id = ?", (g,))]
+    assert homes == [0, 0]
+    assert conn.execute("SELECT SUM(home) FROM player_games WHERE game_id = ?", (g,)).fetchone()[0] == 0
+    assert any('neutral-site' in m for m in msgs)
+    # every other game still has exactly one home team
+    bad = conn.execute("SELECT COUNT(*) FROM (SELECT game_id FROM team_games GROUP BY game_id "
+                       "HAVING SUM(home) != 1)").fetchone()[0]
+    assert bad == 1
 
 
 def test_duplicates_dropped():

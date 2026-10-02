@@ -131,16 +131,31 @@ def upsert(conn, table, frame, cols):
     return len(rows)
 
 
-def ingest_frames(conn, season, season_type, player_raw, team_raw):
-    """Normalize + store raw LeagueGameLog frames. Split out so it can be tested offline."""
+def ingest_frames(conn, season, season_type, player_raw, team_raw, log=print):
+    """Normalize + store raw LeagueGameLog frames. Split out so it can be tested offline.
+
+    Irregular games are handled rather than rejected:
+      * a game with only one team row (incomplete in the feed) -> its team row is skipped;
+        player rows are kept (they are real stats)
+      * a game whose two rows don't split into one home + one away (neutral site, e.g. the
+        NBA Cup final or international games) -> both teams stored as home = 0, so no
+        home-court advantage is attributed to either side
+    """
     p = normalize_player_frame(player_raw, season, season_type)
     t = normalize_team_frame(team_raw, season, season_type)
     if not t.empty:
-        # Each game must have exactly two team rows (home + away).
         per_game = t.groupby('game_id')['home'].agg(['size', 'sum'])
-        bad = per_game[(per_game['size'] != 2) | (per_game['sum'] != 1)]
-        if len(bad):
-            raise ValueError(f"{len(bad)} games without exactly one home and one away row")
+        incomplete = per_game.index[per_game['size'] != 2]
+        neutral = per_game.index[(per_game['size'] == 2) & (per_game['sum'] != 1)]
+        if len(incomplete):
+            log(f"⚠️ {season_str(season)} {season_type}: skipped {len(incomplete)} game(s) with only "
+                f"one team row: {', '.join(incomplete[:5])}")
+            t = t[~t['game_id'].isin(incomplete)]
+        if len(neutral):
+            log(f"ℹ️ {season_str(season)} {season_type}: {len(neutral)} neutral-site game(s), "
+                "no home court applied")
+            t.loc[t['game_id'].isin(neutral), 'home'] = 0
+            p.loc[p['game_id'].isin(neutral), 'home'] = 0
     return upsert(conn, 'player_games', p, PLAYER_COLS), upsert(conn, 'team_games', t, TEAM_COLS)
 
 
@@ -157,7 +172,7 @@ def ingest_season(conn, season, season_types=SEASON_TYPES, pause=1.0, log=print)
                 log(f"⚠️ Skipping play-in games: {e}")
                 continue
             raise
-        n_p, n_t = ingest_frames(conn, season, st, p_raw, t_raw)
+        n_p, n_t = ingest_frames(conn, season, st, p_raw, t_raw, log=log)
         log(f"✅ {season_str(season)} {st:<14} {n_p:>6} player-games, {n_t:>5} team-games")
         total_p += n_p
         total_t += n_t

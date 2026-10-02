@@ -360,7 +360,7 @@ def settle_games(conn):
     for gid, d, home, away, market, line, pick in rows:
         r = conn.execute("""SELECT h.pts, a.pts FROM team_games h JOIN team_games a
                             ON a.game_id = h.game_id AND a.team = h.opponent
-                            WHERE h.team = ? AND h.opponent = ? AND h.game_date = ? AND h.home = 1""",
+                            WHERE h.team = ? AND h.opponent = ? AND h.game_date = ?""",
                          (home, away, d)).fetchone()
         if not r:
             continue
