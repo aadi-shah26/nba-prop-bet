@@ -48,6 +48,23 @@ moneyline to get a pick for each.
 you've logged, plus the full log. **This is the real test of edge.** Without free historical
 lines nobody can backtest profit, so give it a few hundred logged props before trusting it.
 
+### Optional: live lines from The Odds API
+
+Typing lines in always works. If you'd rather pull them from the books, get a key at
+[the-odds-api.com](https://the-odds-api.com) and put it in a `.env` file in this folder
+(git-ignored) or in your environment:
+
+```
+ODDS_API_KEY=your_key_here
+```
+
+Each tab then shows a **📡 Import … from The Odds API** panel: pick a date and a book
+(DraftKings, FanDuel, BetMGM, Caesars, …), load the games, and evaluate any line in one click.
+Imported evaluations go through exactly the same model and are logged with the book's name.
+Credits: listing games is free, a whole slate of spreads/totals/moneylines is 3 credits, and
+props cost 1 credit per market per game. The panel shows your remaining credits after each call.
+Without a key, nothing changes.
+
 The sidebar has the minimum EV to bet (default 3%) and a switch to stop saving evaluations.
 
 ### Terminal versions (optional)
@@ -58,6 +75,7 @@ python projection_model.py "shai" PTS --opp LAL         # fair line + probabilit
 python game_model.py --home BOS --away LAL --spread -5.5 --total 221.5 --ml -230 +190
 python bet_signals.py --report
 python daily_update.py                                   # same as the Update data button
+python odds_fetcher.py games --book fanduel              # optional: today's lines (needs ODDS_API_KEY)
 ```
 
 ## How the models work
@@ -142,6 +160,7 @@ and rest (projections lag sudden role changes — April is the weakest month), t
 | `tracking.py` | Performance summaries for the Results tab and report |
 | `game_model.py` | Team ratings, score/spread/total/moneyline model |
 | `odds.py` | American odds, no-vig, EV, Kelly |
+| `odds_fetcher.py` | Optional The Odds API client (game lines + player props) |
 | `backtest.py` | Walk-forward backtests and parameter tuning |
 | `db.py`, `schema.sql` | Database, season helpers, player/team name matching |
 | `tests/` | `python -m pytest tests` |

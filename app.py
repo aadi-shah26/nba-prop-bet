@@ -3,9 +3,10 @@ NBA betting model — local web app.
 
     streamlit run app.py          (or double-click start.command on a Mac)
 
-Everything is entered by hand: pick a player or game, type the line and the prices, get
-OVER / UNDER / PASS with the numbers behind it. Evaluations are saved to your log and
-settled automatically when you press "Update data".
+Pick a player or game, type the line and the prices, get OVER / UNDER / PASS with the
+numbers behind it. Optionally, with an ODDS_API_KEY set, lines can be imported from The Odds
+API instead of typed. Evaluations are saved to your log and settled automatically when you
+press "Update data".
 """
 
 from datetime import date
@@ -16,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from bet_signals import delete_prop, evaluate_prop, log_prop, settle_prop_manual
+import odds_fetcher
 from db import DB_PATH, connect, init_db, recent_players, season_for_date
 from game_model import (GameContext, delete_game_bets, evaluate_markets, log_game_evals, settle_game_manual,
                         stale_warning)
@@ -98,6 +100,57 @@ def pct(x):
     return f"{x:.1%}"
 
 
+def bad_odds(prices):
+    return [f"{o} isn't valid American odds (use e.g. -110 or +120)." for o in prices if -100 < o < 100]
+
+
+def run_prop(player_id, stat, line, over_odds, under_odds, opponent, minutes, game_date, book=None):
+    """Evaluate one prop (typed or imported), keep it for display and log it."""
+    try:
+        ctx = prop_context(game_date, version)
+        r = evaluate_prop(ctx, player_id, stat, float(line), int(over_odds), int(under_odds),
+                          opponent=opponent, minutes=minutes, min_ev=min_ev)
+    except Exception as e:
+        st.error(f"{type(e).__name__}: {e}")
+        return
+    if r is None:
+        st.error("Not enough recent games to project this player.")
+        return
+    st.session_state['prop_result'] = r
+    if save:
+        conn = db()
+        log_prop(conn, r, book=book)
+        conn.close()
+
+
+def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, total_odds=None,
+             ml=None, book=None):
+    """Evaluate one game's lines (typed or imported), keep them for display and log them."""
+    try:
+        ctx = game_context(game_date, version)
+        pred = ctx.evaluate(home, away, spread, total)
+        evals = evaluate_markets(pred, spread, spread_odds, total, total_odds, ml, min_ev)
+    except Exception as e:
+        st.error(f"{type(e).__name__}: {e}")
+        return
+    st.session_state['game_result'] = (pred, evals, stale_warning(ctx), ctx.calibrated, ctx.game_date)
+    if save and evals:
+        conn = db()
+        log_game_evals(conn, ctx.game_date, pred, evals, book=book)
+        conn.close()
+
+
+def _api_call(fn, *args):
+    """Call The Odds API, showing failures and credit usage instead of crashing the app."""
+    try:
+        result, usage = fn(*args)
+    except Exception as e:
+        st.error(f"{type(e).__name__}: {e}")
+        return None
+    st.session_state['odds_api_usage'] = odds_fetcher.usage_text(usage)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Sidebar: data status + settings
 # ---------------------------------------------------------------------------
@@ -146,6 +199,102 @@ if not n_player_games:
 tab_prop, tab_game, tab_results = st.tabs(["🎯 Player prop", "🏀 Game", "📒 My results"])
 
 
+
+# ---------------------------------------------------------------------------
+# Optional: import lines from The Odds API (only shown when ODDS_API_KEY is set)
+# ---------------------------------------------------------------------------
+
+def odds_api_prop_panel(players):
+    with st.expander("📡 Import a prop from The Odds API (optional)"):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        d = c1.date_input("Game date", value=date.today(), key="oa_pdate")
+        book = c2.selectbox("Book", options=list(odds_fetcher.BOOKS), format_func=odds_fetcher.BOOKS.get,
+                            key="oa_pbook")
+        markets = c3.multiselect("Markets", options=list(odds_fetcher.PROP_MARKETS),
+                                 default=['player_points'], key="oa_pmarkets",
+                                 format_func=lambda m: STAT_LABELS[odds_fetcher.PROP_MARKETS[m]])
+        if st.button("Load games (free)", key="oa_events"):
+            ev = _api_call(odds_fetcher.fetch_events, d.isoformat())
+            if ev is not None:
+                st.session_state['oa_event_list'] = ev
+                st.session_state.pop('oa_prop_rows', None)
+        events = st.session_state.get('oa_event_list')
+        if events is None:
+            return
+        if not events:
+            st.info(f"No games on {d.isoformat()}.")
+            return
+        ev_ix = st.selectbox("Game", options=range(len(events)), key="oa_event",
+                             format_func=lambda i: f"{events[i]['away']} @ {events[i]['home']}")
+        if st.button(f"Load props ({len(markets)} credit{'s' * (len(markets) != 1)})", key="oa_props",
+                     disabled=not markets):
+            e = events[ev_ix]
+            rows = _api_call(odds_fetcher.fetch_event_props, e['event_id'], e['game_date'], tuple(markets), book)
+            if rows is not None:
+                conn = db()
+                try:
+                    st.session_state['oa_prop_rows'] = odds_fetcher.match_players(conn, rows)
+                finally:
+                    conn.close()
+        rows = st.session_state.get('oa_prop_rows')
+        if rows is not None:
+            if not rows:
+                st.info("That book has no two-sided props for this game yet.")
+            else:
+                i = st.selectbox("Prop", options=range(len(rows)), key="oa_prop", format_func=lambda i: (
+                    f"{rows[i]['player']} — {STAT_LABELS[rows[i]['stat']]} {rows[i]['line']:g} · "
+                    f"O {rows[i]['over_odds']:+d} / U {rows[i]['under_odds']:+d}"
+                    + ("" if rows[i]['player_id'] in players else "  (not in database)")))
+                if st.button("Evaluate imported prop", type="primary", key="oa_eval_prop"):
+                    r = rows[i]
+                    if r['player_id'] not in players:
+                        st.error(f"Couldn't match {r['player']} to a player in the database.")
+                    else:
+                        ctx = prop_context(r['game_date'], version)
+                        hist = ctx.player_history(r['player_id'])
+                        team = hist.iloc[-1]['team'] if hist is not None else None
+                        opp = r['away'] if team == r['home'] else r['home'] if team == r['away'] else None
+                        run_prop(r['player_id'], r['stat'], r['line'], r['over_odds'], r['under_odds'],
+                                 opp, None, r['game_date'], book=r['book'])
+        if st.session_state.get('odds_api_usage'):
+            st.caption(st.session_state['odds_api_usage'])
+
+
+def odds_api_game_panel():
+    with st.expander("📡 Import game lines from The Odds API (optional)"):
+        c1, c2 = st.columns(2)
+        d = c1.date_input("Game date", value=date.today(), key="oa_gdate")
+        book = c2.selectbox("Book", options=list(odds_fetcher.BOOKS), format_func=odds_fetcher.BOOKS.get,
+                            key="oa_gbook")
+        if st.button("Load lines (3 credits)", key="oa_lines"):
+            games = _api_call(odds_fetcher.fetch_game_lines, book, d.isoformat())
+            if games is not None:
+                st.session_state['oa_game_list'] = games
+        games = st.session_state.get('oa_game_list')
+        if games is not None:
+            games = [g for g in games if g['home'] and g['away']]
+            if not games:
+                st.info("No games with lines at that book on that date.")
+            else:
+                def glabel(i):
+                    g = games[i]
+                    parts = [f"{g['away']} @ {g['home']}"]
+                    if 'spread' in g:
+                        parts.append(f"{g['home']} {g['spread']:+g}")
+                    if 'total' in g:
+                        parts.append(f"total {g['total']:g}")
+                    if 'ml' in g:
+                        parts.append(f"ML {g['ml'][0]:+d}/{g['ml'][1]:+d}")
+                    return " · ".join(parts)
+                i = st.selectbox("Game", options=range(len(games)), format_func=glabel, key="oa_game")
+                if st.button("Evaluate imported game", type="primary", key="oa_eval_game"):
+                    g = games[i]
+                    run_game(g['home'], g['away'], g['game_date'], g.get('spread'), g.get('spread_odds'),
+                             g.get('total'), g.get('total_odds'), g.get('ml'), book=g['book'])
+        if st.session_state.get('odds_api_usage'):
+            st.caption(st.session_state['odds_api_usage'])
+
+
 # ---------------------------------------------------------------------------
 # Player prop
 # ---------------------------------------------------------------------------
@@ -171,6 +320,8 @@ def prop_chart(r):
 with tab_prop:
     players = player_options(version)
     teams = team_options()
+    if odds_fetcher.enabled():
+        odds_api_prop_panel(players)
     with st.form("prop"):
         c1, c2, c3 = st.columns([2.2, 1.3, 1])
         player_id = c1.selectbox("Player", options=list(players), format_func=players.get, index=None,
@@ -192,27 +343,12 @@ with tab_prop:
     if go:
         problems = [m for ok, m in ((player_id is not None, "Pick a player."), (line is not None, "Enter a line."))
                     if not ok]
-        problems += [f"{o} isn't valid American odds (use e.g. -110 or +120)."
-                     for o in (over_odds, under_odds) if -100 < o < 100]
+        problems += bad_odds((over_odds, under_odds))
         if problems:
             for m in problems:
                 st.error(m)
         else:
-            try:
-                ctx = prop_context(game_date.isoformat(), version)
-                r = evaluate_prop(ctx, player_id, stat, float(line), int(over_odds), int(under_odds),
-                                  opponent=opp, minutes=minutes, min_ev=min_ev)
-            except Exception as e:
-                st.error(f"{type(e).__name__}: {e}")
-                r = None
-            if r is None:
-                st.error("Not enough recent games to project this player.")
-            else:
-                st.session_state['prop_result'] = r
-                if save:
-                    conn = db()
-                    log_prop(conn, r)
-                    conn.close()
+            run_prop(player_id, stat, line, over_odds, under_odds, opp, minutes, game_date.isoformat())
 
     r = st.session_state.get('prop_result')
     if r:
@@ -260,6 +396,8 @@ with tab_prop:
 
 with tab_game:
     teams = team_options()
+    if odds_fetcher.enabled():
+        odds_api_game_panel()
     with st.form("game"):
         c1, c2, c3 = st.columns([1.5, 1.5, 1])
         away = c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
@@ -299,26 +437,15 @@ with tab_game:
             problems.append("Enter both moneyline prices (or neither).")
         prices = [spread_home, spread_away, total_over, total_under] + \
             [x for x in (ml_home, ml_away) if x is not None]
-        problems += [f"{o} isn't valid American odds (use e.g. -110 or +120)." for o in prices if -100 < o < 100]
+        problems += bad_odds(prices)
         if problems:
             for m in problems:
                 st.error(m)
         else:
-            try:
-                ctx = game_context(gdate.isoformat(), version)
-                pred = ctx.evaluate(home, away, spread, total)
-                evals = evaluate_markets(
-                    pred, spread, (int(spread_home), int(spread_away)) if spread is not None else None,
-                    total, (int(total_over), int(total_under)) if total is not None else None,
-                    (int(ml_home), int(ml_away)) if ml_home is not None else None, min_ev)
-                st.session_state['game_result'] = (pred, evals, stale_warning(ctx), ctx.calibrated,
-                                                   ctx.game_date)
-                if save and evals:
-                    conn = db()
-                    log_game_evals(conn, ctx.game_date, pred, evals)
-                    conn.close()
-            except Exception as e:
-                st.error(f"{type(e).__name__}: {e}")
+            run_game(home, away, gdate.isoformat(),
+                     spread, (int(spread_home), int(spread_away)) if spread is not None else None,
+                     total, (int(total_over), int(total_under)) if total is not None else None,
+                     (int(ml_home), int(ml_away)) if ml_home is not None else None)
 
     res = st.session_state.get('game_result')
     if res:

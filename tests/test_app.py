@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import db
+import odds_fetcher
 from fetch_game_logs import ingest_frames
 from tests.conftest import make_league
 
@@ -14,6 +15,9 @@ st_testing = pytest.importorskip('streamlit.testing.v1')
 
 @pytest.fixture
 def app_db(tmp_path, monkeypatch):
+    # The Odds API panels are off unless a key is configured; keep them off by default.
+    monkeypatch.delenv('ODDS_API_KEY', raising=False)
+    monkeypatch.setattr(odds_fetcher, 'ENV_FILE', tmp_path / 'no.env')
     path = tmp_path / 'app.db'
     conn = db.connect(path)
     db.init_db(conn)
@@ -123,3 +127,59 @@ def test_manual_settle_and_delete_in_app(app_db):
     at.run()
     assert not at.exception
     assert app_db.execute("SELECT COUNT(*) FROM prop_log WHERE id=?", (row_id,)).fetchone()[0] == 0
+
+
+def test_odds_api_panels_hidden_without_key(app_db):
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception
+    assert not any('Odds API' in e.label for e in at.expander)
+
+
+def test_odds_api_import_flow(app_db, monkeypatch):
+    d, home, away = _game_date(app_db)
+    names = {t: f"{t} Name" for t in (home, away)}
+    monkeypatch.setenv('ODDS_API_KEY', 'test')
+    monkeypatch.setattr(odds_fetcher, 'team_abbr', lambda n: {v: k for k, v in names.items()}.get(n, n))
+    event = {'id': 'ev1', 'commence_time': f'{d}T23:00:00Z', 'home_team': names[home], 'away_team': names[away]}
+    outcomes = [{'name': 'Over', 'description': f'{home} Player0', 'price': -110, 'point': 18.5},
+                {'name': 'Under', 'description': f'{home} Player0', 'price': -110, 'point': 18.5}]
+    calls = []
+
+    def fake_get(path, **params):
+        calls.append(path)
+        usage = {'last': '1', 'used': '1', 'remaining': '499'}
+        if path.endswith('/events'):
+            return [event], usage
+        if '/events/ev1/odds' in path:
+            return {**event, 'bookmakers': [{'key': 'draftkings', 'markets': [
+                {'key': 'player_points', 'outcomes': outcomes}]}]}, usage
+        return [{**event, 'bookmakers': [{'key': 'draftkings', 'markets': [
+            {'key': 'spreads', 'outcomes': [{'name': names[home], 'price': -110, 'point': -1.5},
+                                            {'name': names[away], 'price': -110, 'point': 1.5}]},
+            {'key': 'totals', 'outcomes': [{'name': 'Over', 'price': -110, 'point': 220.5},
+                                           {'name': 'Under', 'price': -110, 'point': 220.5}]}]}]}], usage
+
+    monkeypatch.setattr(odds_fetcher, '_get', fake_get)
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception
+
+    at.date_input(key='oa_pdate').set_value(date.fromisoformat(d))
+    _w(at.button, 'Load games (free)').click()
+    at.run()
+    _w(at.button, 'Load props (1 credit)').click()
+    at.run()
+    _w(at.button, 'Evaluate imported prop').click()
+    at.run()
+    assert not at.exception and not at.error
+    assert any('BET OVER' in s.value for s in at.success)       # ~25 ppg scorer vs 18.5
+    assert app_db.execute("SELECT book, opponent, line FROM prop_log").fetchone() == ('draftkings', away, 18.5)
+
+    at.date_input(key='oa_gdate').set_value(date.fromisoformat(d))
+    _w(at.button, 'Load lines (3 credits)').click()
+    at.run()
+    _w(at.button, 'Evaluate imported game').click()
+    at.run()
+    assert not at.exception and not at.error
+    assert app_db.execute("SELECT market, line, book FROM game_log ORDER BY market").fetchall() == \
+        [('SPREAD', -1.5, 'draftkings'), ('TOTAL', 220.5, 'draftkings')]
+    assert any('remaining 499' in c.value for c in at.caption)
