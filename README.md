@@ -42,10 +42,11 @@ steals+blocks, turnovers.
 
 **🏀 Game** — choose away and home team. Leave the lines blank to just get the predicted
 score and win probability, or fill in any of spread (the **home** team's line), total and
-moneyline to get a pick for each. Once both teams are picked, mark anyone **out tonight**
-(players are listed best first; check the injury report). Everyone else who played in the
-team's last 10 games is assumed to play. The result shows the lineup and back-to-back
-adjustments it applied.
+moneyline to get a pick for each. Once both teams are picked, a **who's playing tonight** checklist
+appears for each team (best players first; check the injury report). Everyone from the team's
+last 10 games starts ticked, so untick anyone who's out. Players who haven't played lately
+(injured, out of the rotation) start unticked, so tick anyone returning. The result shows the
+lineup and back-to-back adjustments it applied.
 
 **📒 My results** — record, profit, ROI and the model-vs-market Brier score on everything
 you've logged, plus the full log. **This is the real test of edge.** Without free historical
@@ -77,6 +78,7 @@ python bet_signals.py "shai" PTS 31.5 --over -115 --under -105 --opp LAL
 python projection_model.py "shai" PTS --opp LAL         # fair line + probability ladder
 python game_model.py --home BOS --away LAL --spread -5.5 --total 221.5 --ml -230 +190
 python game_model.py --home BOS --away LAL --home-out "Jayson Tatum" --away-out "LeBron"
+python game_model.py --home OKC --away DEN --home-in "Jalen Williams"   # back from injury
 python bet_signals.py --report
 python daily_update.py                                   # same as the Update data button
 python odds_fetcher.py games --book fanduel              # optional: today's lines (needs ODDS_API_KEY)

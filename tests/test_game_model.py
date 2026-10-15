@@ -110,7 +110,7 @@ def test_lineup_delta_skipped_in_playoffs(league_conn):
 def test_star_out_lowers_margin(league_conn):
     ctx = GameContext(league_conn, '2026-02-01')
     roster = ctx.roster('BOS')
-    assert len(roster) == 2 and roster['value'].is_monotonic_decreasing
+    assert len(roster) == 2 and roster['value'].is_monotonic_decreasing and roster['recent'].all()
     star = int(roster['player_id'].iloc[0])
     full = ctx.evaluate('BOS', 'LAL')
     hurt = ctx.evaluate('BOS', 'LAL', home_out=[star])
@@ -144,3 +144,23 @@ def test_calibrate_stores_coefs(league_conn):
     sd_m, sd_t, n, coefs = calibrate(league_conn, min_games=10)
     assert n > 10 and sd_m > 0 and set(coefs) == {'scale', 'b2b', 'lineup'}
     assert stored_coefs(league_conn) == pytest.approx(coefs)
+
+
+def test_returning_player_can_be_marked_in(league_conn):
+    star = league_conn.execute("SELECT player_id FROM player_games WHERE team='BOS' "
+                               "ORDER BY minutes DESC").fetchone()[0]
+    dates = [r[0] for r in league_conn.execute(
+        "SELECT game_date FROM team_games WHERE team='BOS' AND game_date < '2026-02-01' "
+        "ORDER BY game_date DESC")]
+    # the star sits out BOS's last 12 games
+    league_conn.execute("DELETE FROM player_games WHERE player_id=? AND game_date >= ?", (star, dates[11]))
+    league_conn.commit()
+    ctx = GameContext(league_conn, '2026-02-01')
+    r = ctx.roster('BOS')
+    assert not r.loc[r['player_id'] == star, 'recent'].iloc[0]
+    without = ctx.evaluate('BOS', 'LAL')
+    back = ctx.evaluate('BOS', 'LAL', home_in=[star])
+    assert back['margin'] > without['margin'] + 1
+    # marking him both in and out means out
+    assert ctx.evaluate('BOS', 'LAL', home_in=[star], home_out=[star])['margin'] == \
+        pytest.approx(without['margin'])

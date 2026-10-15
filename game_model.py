@@ -429,40 +429,53 @@ class GameContext:
             vals = player_values(pg, self.params)
             lh = lineup_history(vals, self.params)
             self._lineup_ref = lh.groupby('team')['ref_post'].last().dropna().to_dict()
-            latest = vals.groupby('player_id').tail(1)
+            latest = vals.groupby('player_id').tail(1).copy()
+            d = pd.to_datetime(latest['game_date'])
+            latest['season'] = np.where(d.dt.month >= 8, d.dt.year, d.dt.year - 1)
             for team, g in vals.groupby('team'):
                 recent = g['game_id'].drop_duplicates().iloc[-self.params.roster_recent_games:]
                 ids = set(g.loc[g['game_id'].isin(recent), 'player_id'])
-                r = latest[latest['player_id'].isin(ids) & (latest['team'] == team)]
+                mine = latest[latest['team'] == team]
+                # also this season's players who haven't played lately (injured, out of the
+                # rotation) so they can be marked as playing when they return
+                r = mine[mine['player_id'].isin(ids) | (mine['season'] == mine['season'].max())]
                 self._rosters[team] = (r[['player_id', 'player_name', 'val_post', 'game_date']]
                                        .rename(columns={'val_post': 'value', 'game_date': 'last_game'})
-                                       .sort_values('value', ascending=False).reset_index(drop=True))
+                                       .assign(recent=r['player_id'].isin(ids).to_numpy())
+                                       .sort_values(['recent', 'value'], ascending=False)
+                                       .reset_index(drop=True))
 
     def roster(self, team):
-        """Players who appeared for the team in its last few games, best first
-        (player_id, player_name, value, last_game). Empty if there is no player data."""
+        """The team's players, best first: player_id, player_name, value, last_game, and recent
+        (True = appeared in the team's last few games, so assumed to play unless marked out).
+        Empty if there is no player data."""
         r = self._rosters.get(team_abbr(team) or team)
         return r.copy() if r is not None else pd.DataFrame(
-            columns=['player_id', 'player_name', 'value', 'last_game'])
+            columns=['player_id', 'player_name', 'value', 'last_game', 'recent'])
 
-    def lineup_delta(self, team, out=()):
-        """Tonight's lineup strength vs the team's recent norm, with `out` (player ids) missing."""
+    def lineup_delta(self, team, out=(), extra=()):
+        """Tonight's lineup strength vs the team's recent norm. Recent players play unless in
+        `out`; players in `extra` (ids, e.g. back from injury) play too."""
         ref = self._lineup_ref.get(team)
         r = self._rosters.get(team)
         if ref is None or r is None or not self.use_lineups:
             return 0.0
-        avail = r[~r['player_id'].isin(set(out))]
-        return float(avail['value'].head(self.params.lineup_size).sum() - ref)
+        playing = (r['recent'] | r['player_id'].isin(set(extra))) & ~r['player_id'].isin(set(out))
+        vals = r.loc[playing, 'value'].sort_values(ascending=False)
+        return float(vals.head(self.params.lineup_size).sum() - ref)
 
-    def evaluate(self, home, away, spread=None, total=None, home_out=(), away_out=()):
+    def evaluate(self, home, away, spread=None, total=None, home_out=(), away_out=(),
+                 home_in=(), away_in=()):
         """home_out / away_out: player ids not playing tonight (everyone else who played
-        recently is assumed to play)."""
+        recently is assumed to play). home_in / away_in: players who haven't played lately
+        but will tonight."""
         home, away = team_abbr(home), team_abbr(away)
         if not home or not away:
             raise ValueError("Unknown team")
         pred = adjust_prediction(predict_game(self.ratings, home, away), self.coefs,
                                  int(home in self.played_yesterday), int(away in self.played_yesterday),
-                                 self.lineup_delta(home, home_out), self.lineup_delta(away, away_out))
+                                 self.lineup_delta(home, home_out, home_in),
+                                 self.lineup_delta(away, away_out, away_in))
         pred.update(market_probs(pred, self.sd_margin, self.sd_total, spread, total))
         return pred
 
@@ -637,7 +650,7 @@ def adjustment_text(pred):
 
 
 def resolve_out(ctx, team, names):
-    """Player names (as typed) -> player ids on that team's recent roster."""
+    """Player names (as typed) -> player ids on that team's roster."""
     from db import normalize_name
     roster = ctx.roster(team)
     ids = []
@@ -648,7 +661,7 @@ def resolve_out(ctx, team, names):
         if hit.empty:
             hit = roster[norm.str.contains(q, regex=False)]
         if len(hit) != 1:
-            raise ValueError(f"'{name}' matches {len(hit)} players on {team_abbr(team)}'s recent roster")
+            raise ValueError(f"'{name}' matches {len(hit)} players on {team_abbr(team)}'s roster")
         ids.append(int(hit['player_id'].iloc[0]))
     return ids
 
@@ -673,6 +686,10 @@ def main():
     ap.add_argument('--no-log', action='store_true', help="don't write evaluations to game_log")
     ap.add_argument('--home-out', nargs='+', default=[], metavar='PLAYER', help="home players out tonight")
     ap.add_argument('--away-out', nargs='+', default=[], metavar='PLAYER', help="away players out tonight")
+    ap.add_argument('--home-in', nargs='+', default=[], metavar='PLAYER',
+                    help="home players back tonight who haven't played lately")
+    ap.add_argument('--away-in', nargs='+', default=[], metavar='PLAYER',
+                    help="away players back tonight who haven't played lately")
     a = ap.parse_args()
 
     conn = connect()
@@ -681,7 +698,9 @@ def main():
     ctx = GameContext(conn, a.date)
     pred = ctx.evaluate(a.home, a.away, a.spread, a.total,
                         home_out=resolve_out(ctx, a.home, a.home_out),
-                        away_out=resolve_out(ctx, a.away, a.away_out))
+                        away_out=resolve_out(ctx, a.away, a.away_out),
+                        home_in=resolve_out(ctx, a.home, a.home_in),
+                        away_in=resolve_out(ctx, a.away, a.away_in))
     evals = evaluate_markets(pred, a.spread, a.spread_odds if a.spread is not None else None,
                              a.total, a.total_odds if a.total is not None else None, a.ml, a.min_ev)
     print_game(pred, ctx, evals)

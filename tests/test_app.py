@@ -185,18 +185,18 @@ def test_odds_api_import_flow(app_db, monkeypatch):
     assert any('remaining 499' in c.value for c in at.caption)
 
 
-def test_game_players_out(app_db):
+def test_game_lineup_checklist(app_db):
     d, home, away = _game_date(app_db)
-    star, name = app_db.execute("SELECT player_id, player_name FROM player_games WHERE team=? "
-                                "ORDER BY minutes DESC", (home,)).fetchone()
+    star = app_db.execute("SELECT player_id FROM player_games WHERE team=? ORDER BY minutes DESC",
+                          (home,)).fetchone()[0]
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
     at.date_input[1].set_value(date.fromisoformat(d))
     _w(at.selectbox, 'Away team').set_value(away)
     _w(at.selectbox, 'Home team').set_value(home)
     at.run()
-    out = _w(at.multiselect, f'{home} players out tonight')
-    assert star in out.options or name in out.options
-    out.set_value([star])
+    box = at.checkbox(key=f"play_{home}_{star}_{d}")
+    assert box.value is True                     # recent players start as playing
+    box.uncheck()
     _w(at.button, 'Evaluate game').click()
     at.run()
     assert not at.exception and not at.error

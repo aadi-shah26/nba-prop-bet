@@ -124,11 +124,11 @@ def run_prop(player_id, stat, line, over_odds, under_odds, opponent, minutes, ga
 
 
 def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, total_odds=None,
-             ml=None, book=None, home_out=(), away_out=()):
+             ml=None, book=None, lineups=None):
     """Evaluate one game's lines (typed or imported), keep them for display and log them."""
     try:
         ctx = game_context(game_date, version)
-        pred = ctx.evaluate(home, away, spread, total, home_out=home_out, away_out=away_out)
+        pred = ctx.evaluate(home, away, spread, total, **(lineups or {}))
         evals = evaluate_markets(pred, spread, spread_odds, total, total_odds, ml, min_ev)
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
@@ -140,28 +140,40 @@ def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, t
         conn.close()
 
 
-def out_tonight_inputs(away, home, game_date):
-    """Multiselects for players missing tonight. Returns (away_out_ids, home_out_ids)."""
+def lineup_inputs(away, home, game_date):
+    """A playing/out checklist per team. Players from the team's last few games start ticked
+    (untick anyone out); this season's other players start unticked (tick anyone back).
+    Returns {'away_out', 'away_in', 'home_out', 'home_in'}: lists of player ids."""
+    res = {'away_out': [], 'away_in': [], 'home_out': [], 'home_in': []}
     if not away or not home or away == home:
-        return [], []
+        return res
     try:
         ctx = game_context(game_date, version)
     except Exception:
-        return [], []
+        return res
     if not ctx.use_lineups:
         st.caption("Playoffs: the lineup adjustment is off (it made playoff picks worse in testing).")
-        return [], []
-    outs = []
-    cols = st.columns(2)
-    for col, team in zip(cols, (away, home)):
+        return res
+    st.markdown("**Who's playing tonight?** Check the injury report. Untick anyone who's out, "
+                "and tick anyone returning who hasn't played lately. Best players are listed first.")
+    for col, team, side in zip(st.columns(2), (away, home), ('away', 'home')):
         r = ctx.roster(team)
-        names = dict(zip(r['player_id'].astype(int), r['player_name']))
-        outs.append(col.multiselect(f"{team} players out tonight", options=list(names),
-                                    format_func=names.get, key=f"out_{team}_{game_date}",
-                                    placeholder="Everyone who played recently is assumed in",
-                                    help="Players are listed best first. Check the injury report: "
-                                         "the model can't see who's resting or hurt."))
-    return outs[0], outs[1]
+        with col.container(border=True):
+            st.markdown(f"**{team}**")
+            for recent, heading in ((True, None), (False, "Haven't played lately")):
+                group = r[r['recent'] == recent]
+                if group.empty:
+                    continue
+                if heading:
+                    st.caption(heading)
+                for p in group.itertuples():
+                    on = st.checkbox(p.player_name, value=recent, key=f"play_{team}_{p.player_id}_{game_date}",
+                                     help=f"Value {p.value:.1f} (recent Game Score) · last played {p.last_game}")
+                    if recent and not on:
+                        res[f'{side}_out'].append(int(p.player_id))
+                    elif on and not recent:
+                        res[f'{side}_in'].append(int(p.player_id))
+    return res
 
 
 def _api_call(fn, *args):
@@ -422,14 +434,14 @@ with tab_game:
     teams = team_options()
     if odds_fetcher.enabled():
         odds_api_game_panel()
-    # Teams and date sit outside the form so the "out tonight" lists follow the chosen teams.
+    # Teams and date sit outside the form so the playing/out checklists follow the chosen teams.
     c1, c2, c3 = st.columns([1.5, 1.5, 1])
     away = c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
                         index=None, placeholder="Away")
     home = c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
                         index=None, placeholder="Home")
     gdate = c3.date_input("Game date", value=date.today(), key="gdate")
-    away_out, home_out = out_tonight_inputs(away, home, gdate.isoformat())
+    lineups = lineup_inputs(away, home, gdate.isoformat())
 
     with st.form("game"):
         st.caption("Lines are optional — leave blank to just get the predicted score.")
@@ -472,7 +484,7 @@ with tab_game:
                      spread, (int(spread_home), int(spread_away)) if spread is not None else None,
                      total, (int(total_over), int(total_under)) if total is not None else None,
                      (int(ml_home), int(ml_away)) if ml_home is not None else None,
-                     home_out=home_out, away_out=away_out)
+                     lineups=lineups)
 
     res = st.session_state.get('game_result')
     if res:
