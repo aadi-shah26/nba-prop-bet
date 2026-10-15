@@ -178,27 +178,49 @@ def tune_props(season, stats, jobs=4):
 # Games
 # ---------------------------------------------------------------------------
 
-def run_games(tg, seasons, params=None):
+def record_pick(tg, df, prior_games=10):
+    """Baseline: pick the team with the better record before the game (regular-season games
+    this season, plus `prior_games` games at last season's win% so October isn't a coin flip).
+    Ties go to the home team. Returns a boolean Series: True = home picked."""
+    t = tg[tg['season_type'] == 'Regular Season']
+    wins = t.assign(w=(t['wl'] == 'W').astype(int)).sort_values('game_date')
+    last = wins.groupby(['season', 'team'])['w'].mean().to_dict()
+
+    def wp(team, season, d):
+        cur = wins[(wins['team'] == team) & (wins['season'] == season) & (wins['game_date'] < d)]['w']
+        prior = last.get((season - 1, team), 0.5)
+        return (cur.sum() + prior_games * prior) / (len(cur) + prior_games)
+    return pd.Series([wp(r.home, r.season, r.game_date) >= wp(r.away, r.season, r.game_date)
+                      for r in df.itertuples()], index=df.index)
+
+
+def run_games(tg, seasons, params=None, pg=None):
     from game_model import GameParams, backtest_games
     params = params or GameParams()
-    df = backtest_games(tg, seasons, params)
+    df = backtest_games(tg, seasons, params, player_games=pg)
+    df['record_pick'] = record_pick(tg, df)
     print(f"\n{'=' * 72}\nGAME MODEL — walk-forward, {len(df)} games\n{'=' * 72}")
     for name, sub in [('all', df)] + list(df.groupby('season')):
         e_m = sub['act_margin'] - sub['pred_margin']
         e_t = sub['act_total'] - sub['pred_total']
         b_m = sub['act_margin'] - sub['base_margin']
         b_t = sub['act_total'] - sub['base_total']
-        win_hit = ((sub['p_home_win'] > 0.5) == (sub['act_margin'] > 0)).mean()
         brier = ((sub['p_home_win'] - (sub['act_margin'] > 0)) ** 2).mean()
         print(f"[{name}] n={len(sub)}  margin MAE {e_m.abs().mean():.2f} (baseline {b_m.abs().mean():.2f})"
               f"  sd {e_m.std():.2f} | total MAE {e_t.abs().mean():.2f} (baseline {b_t.abs().mean():.2f})"
-              f"  sd {e_t.std():.2f} bias {-e_t.mean():+.2f} | winner {win_hit:.1%}  Brier {brier:.4f}")
+              f"  sd {e_t.std():.2f} bias {-e_t.mean():+.2f} | Brier {brier:.4f}")
+        won = sub['act_margin'] > 0
+        print(f"      winner picked: model {((sub['pred_margin'] > 0) == won).mean():.1%} | "
+              f"ratings only {((sub['rating_margin'] > 0) == won).mean():.1%} | "
+              f"better record {(sub['record_pick'] == won).mean():.1%} | home team {won.mean():.1%}")
     cut = pd.cut(df['p_home_win'], [0, .2, .35, .5, .65, .8, 1.0])
     print("\nWin-probability calibration:")
     print(df.groupby(cut, observed=True).agg(n=('p_home_win', 'size'),
                                              predicted=('p_home_win', 'mean'),
                                              actual=('act_margin', lambda m: (m > 0).mean())
                                              ).to_string(float_format=lambda x: f'{x:.3f}'))
+    if pg is None or pg.empty:
+        print("\n(no player data: lineup adjustment off)")
     return df
 
 
@@ -215,7 +237,7 @@ def main():
     conn = connect()
     pg, tg = load(conn)
     if a.mode == 'games':
-        df = run_games(tg, a.seasons)
+        df = run_games(tg, a.seasons, pg=pg)
         if a.csv:
             df.to_csv(a.csv, index=False)
         return

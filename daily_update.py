@@ -4,7 +4,7 @@ Daily maintenance (run once a day after the previous night's games, or press
 "Update data" in the app):
   1. refresh the current season's player and team game logs (first run: last 3 seasons)
   2. settle logged props and game bets against actual results
-  3. re-calibrate the game model's margin/total SDs
+  3. re-calibrate the game model's margin adjustments and margin/total SDs
 
     python daily_update.py
 """
@@ -38,7 +38,9 @@ def update(conn, log=print):
 
     cal = calibrate(conn)
     if cal:
-        log(f"📐 Game model SDs: margin {cal[0]:.2f}, total {cal[1]:.2f} (from {cal[2]} games)")
+        c = cal[3]
+        log(f"📐 Game model SDs: margin {cal[0]:.2f}, total {cal[1]:.2f} (from {cal[2]} games); "
+            f"margin scale {c['scale']:.2f}, back-to-back {c['b2b']:.1f} pts, lineup {c['lineup']:.3f}")
     last = conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
     log(f"📊 Latest game in database: {last}")
     return last
