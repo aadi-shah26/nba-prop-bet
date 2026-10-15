@@ -19,8 +19,8 @@ import streamlit as st
 from bet_signals import delete_prop, evaluate_prop, log_prop, settle_prop_manual
 import odds_fetcher
 from db import DB_PATH, connect, init_db, recent_players, season_for_date
-from game_model import (GameContext, delete_game_bets, evaluate_markets, log_game_evals, settle_game_manual,
-                        stale_warning)
+from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate_markets, log_game_evals,
+                        settle_game_manual, stale_warning)
 from projection_model import PropContext, count_distribution
 from tracking import game_summary, prop_summary, recent_games, recent_props
 
@@ -124,11 +124,11 @@ def run_prop(player_id, stat, line, over_odds, under_odds, opponent, minutes, ga
 
 
 def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, total_odds=None,
-             ml=None, book=None):
+             ml=None, book=None, home_out=(), away_out=()):
     """Evaluate one game's lines (typed or imported), keep them for display and log them."""
     try:
         ctx = game_context(game_date, version)
-        pred = ctx.evaluate(home, away, spread, total)
+        pred = ctx.evaluate(home, away, spread, total, home_out=home_out, away_out=away_out)
         evals = evaluate_markets(pred, spread, spread_odds, total, total_odds, ml, min_ev)
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
@@ -138,6 +138,30 @@ def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, t
         conn = db()
         log_game_evals(conn, ctx.game_date, pred, evals, book=book)
         conn.close()
+
+
+def out_tonight_inputs(away, home, game_date):
+    """Multiselects for players missing tonight. Returns (away_out_ids, home_out_ids)."""
+    if not away or not home or away == home:
+        return [], []
+    try:
+        ctx = game_context(game_date, version)
+    except Exception:
+        return [], []
+    if not ctx.use_lineups:
+        st.caption("Playoffs: the lineup adjustment is off (it made playoff picks worse in testing).")
+        return [], []
+    outs = []
+    cols = st.columns(2)
+    for col, team in zip(cols, (away, home)):
+        r = ctx.roster(team)
+        names = dict(zip(r['player_id'].astype(int), r['player_name']))
+        outs.append(col.multiselect(f"{team} players out tonight", options=list(names),
+                                    format_func=names.get, key=f"out_{team}_{game_date}",
+                                    placeholder="Everyone who played recently is assumed in",
+                                    help="Players are listed best first. Check the injury report: "
+                                         "the model can't see who's resting or hurt."))
+    return outs[0], outs[1]
 
 
 def _api_call(fn, *args):
@@ -398,14 +422,16 @@ with tab_game:
     teams = team_options()
     if odds_fetcher.enabled():
         odds_api_game_panel()
-    with st.form("game"):
-        c1, c2, c3 = st.columns([1.5, 1.5, 1])
-        away = c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
-                            index=None, placeholder="Away")
-        home = c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
-                            index=None, placeholder="Home")
-        gdate = c3.date_input("Game date", value=date.today(), key="gdate")
+    # Teams and date sit outside the form so the "out tonight" lists follow the chosen teams.
+    c1, c2, c3 = st.columns([1.5, 1.5, 1])
+    away = c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                        index=None, placeholder="Away")
+    home = c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                        index=None, placeholder="Home")
+    gdate = c3.date_input("Game date", value=date.today(), key="gdate")
+    away_out, home_out = out_tonight_inputs(away, home, gdate.isoformat())
 
+    with st.form("game"):
         st.caption("Lines are optional — leave blank to just get the predicted score.")
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -445,7 +471,8 @@ with tab_game:
             run_game(home, away, gdate.isoformat(),
                      spread, (int(spread_home), int(spread_away)) if spread is not None else None,
                      total, (int(total_over), int(total_under)) if total is not None else None,
-                     (int(ml_home), int(ml_away)) if ml_home is not None else None)
+                     (int(ml_home), int(ml_away)) if ml_home is not None else None,
+                     home_out=home_out, away_out=away_out)
 
     res = st.session_state.get('game_result')
     if res:
@@ -458,6 +485,9 @@ with tab_game:
         m[2].metric("Total", f"{pred['total']:.1f}", help=f"Projected pace {pred['pace']:.1f} possessions")
         m[3].metric(f"{h} win chance", pct(pred['p_home_win']),
                     help=f"Fair spread: {h} {-pred['margin']:+.1f}")
+        adj = adjustment_text(pred)
+        if adj:
+            st.caption(f"Adjustments to the {h} margin: {adj}")
         if stale:
             st.warning(stale)
         if not calibrated:

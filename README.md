@@ -42,7 +42,10 @@ steals+blocks, turnovers.
 
 **🏀 Game** — choose away and home team. Leave the lines blank to just get the predicted
 score and win probability, or fill in any of spread (the **home** team's line), total and
-moneyline to get a pick for each.
+moneyline to get a pick for each. Once both teams are picked, mark anyone **out tonight**
+(players are listed best first; check the injury report). Everyone else who played in the
+team's last 10 games is assumed to play. The result shows the lineup and back-to-back
+adjustments it applied.
 
 **📒 My results** — record, profit, ROI and the model-vs-market Brier score on everything
 you've logged, plus the full log. **This is the real test of edge.** Without free historical
@@ -73,6 +76,7 @@ The sidebar has the minimum EV to bet (default 3%) and a switch to stop saving e
 python bet_signals.py "shai" PTS 31.5 --over -115 --under -105 --opp LAL
 python projection_model.py "shai" PTS --opp LAL         # fair line + probability ladder
 python game_model.py --home BOS --away LAL --spread -5.5 --total 221.5 --ml -230 +190
+python game_model.py --home BOS --away LAL --home-out "Jayson Tatum" --away-out "LeBron"
 python bet_signals.py --report
 python daily_update.py                                   # same as the Update data button
 python odds_fetcher.py games --book fanduel              # optional: today's lines (needs ODDS_API_KEY)
@@ -92,8 +96,17 @@ python odds_fetcher.py games --book fanduel              # optional: today's lin
 **Games** (`game_model.py`): possessions, offensive/defensive points per 100 and pace for each
 team, recency-weighted, opponent-adjusted (SRS-style) and shrunk to league average.
 Margin uses slower ratings (half-life 20 games), totals faster ones (10 games) — tuned
-walk-forward. Home court is estimated from the data. Margin/total are discretized normals
-whose SDs `daily_update.py` recalibrates from recent residuals.
+walk-forward. Home court is estimated from the data. The rating margin is then adjusted for:
+
+* **lineups**: each player's value is his recency-weighted Game Score; a team's strength is
+  its top 8 players who play. Tonight's strength minus the team's recent norm (weighted like the
+  ratings) moves the margin, so a missing star, or a star back from injury, counts. Off in the
+  playoffs, where it made picks worse in testing.
+* **back-to-backs**: a team that played yesterday loses ~1-3 points.
+* **scale**: shrunk ratings understate real gaps between teams, so the margin is stretched ~1.15-1.2×.
+
+`daily_update.py` refits those three coefficients and the margin/total SDs (margin and total
+are discretized normals) from the most recent ~1,500 walk-forward predictions.
 
 ## Backtest
 
@@ -133,9 +146,21 @@ with a slight under-projection of assists/PRA (−0.1 per game).
 | Total MAE | **14.68** | 15.24 |
 | Winner picked | 64.7% | |
 
-Win probabilities are reasonably calibrated but slightly timid (predicted 71% → won 75%;
-predicted 43% → won 40%). For reference, closing Vegas lines pick roughly 67-69% of winners
-(estimate) — the market is still better than this model on sides.
+**Winner picks, 2025-26** (1,322 games incl. playoffs; adjustment coefficients fitted on 2024-25
+only, so this season is a true hold-out; data from ESPN box scores):
+
+| | All games | Regular season | Playoffs + play-in |
+|---|---|---|---|
+| **Model** (ratings + lineups + back-to-backs + scale) | **69.4%** | **69.7%** | 64.8% |
+| Ratings only (the previous model) | 68.4% | 68.6% | 64.8% |
+| Team with the better record | 66.3% | 67.1% | 54.9% |
+| Home team | 55.5% | 55.5% | 56.0% |
+
+Margin MAE 11.20 vs 11.50 for ratings only, Brier 0.203 vs 0.207. The +1-point gain in
+winners is within noise for one season (95% CI roughly −1 to +3 points); it was also +1.6 on
+2024-25, the fitting season. The DraftKings favourite won 68.5% of the 2025-26 games it had a
+line for, and its probabilities are still sharper than the model's (log loss 0.578 vs 0.594):
+the market is still better than this model on sides.
 
 **Honest read:** the projections are modestly better than simple averages and the
 probabilities are well calibrated, which is a prerequisite for finding edges — not proof of

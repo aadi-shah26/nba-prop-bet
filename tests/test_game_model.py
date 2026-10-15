@@ -1,8 +1,10 @@
+import numpy as np
 import pandas as pd
 import pytest
 
-from game_model import (GameContext, GameParams, backtest_games, build_ratings, evaluate_markets,
-                        game_rows, margin_pmf, market_probs, predict_game, probs_vs_line)
+from game_model import (COEF_BOUNDS, GameContext, GameParams, backtest_games, build_ratings, calibrate,
+                        evaluate_markets, fit_coefs, game_rows, margin_pmf, market_probs, player_values,
+                        predict_game, probs_vs_line, resolve_out, rest_flags, stored_coefs)
 from fetch_game_logs import ingest_frames
 from tests.conftest import make_league
 
@@ -64,3 +66,81 @@ def test_context_and_markets(league_conn):
     for e in ev:
         assert e['pick'] in ('A', 'B', 'PASS')
         assert 0 <= e['fair_a'] <= 1
+
+
+def _frames(conn):
+    return (pd.read_sql_query('SELECT * FROM team_games', conn),
+            pd.read_sql_query('SELECT * FROM player_games', conn))
+
+
+def test_rest_flags():
+    rows = pd.DataFrame({'game_id': ['1', '2', '3', '3'], 'team': ['BOS', 'BOS', 'BOS', 'LAL'],
+                         'game_date': ['2025-11-01', '2025-11-03', '2025-11-04', '2025-11-04']})
+    f = rest_flags(rows)
+    assert f[('1', 'BOS')] == 0 and f[('2', 'BOS')] == 0 and f[('3', 'BOS')] == 1 and f[('3', 'LAL')] == 0
+
+
+def test_player_values_use_only_earlier_games(league_conn):
+    _, pg = _frames(league_conn)
+    v = player_values(pg, GameParams())
+    one = v[v['player_id'] == v['player_id'].iloc[0]].reset_index(drop=True)
+    assert (one['val_pre'].iloc[:5] == 0).all()           # fewer than player_min_games before
+    assert one['val_pre'].iloc[6] == pytest.approx(one['val_post'].iloc[5])
+
+
+def test_backtest_lineup_no_lookahead(league_conn):
+    tg, pg = _frames(league_conn)
+    df = backtest_games(tg, [2025], player_games=pg)
+    assert df['lineup_diff'].abs().sum() > 0
+    first = df.iloc[20]
+    pg2 = pg.copy()
+    pg2.loc[pg2['game_id'] == first['game_id'], 'pts'] += 40   # this game's own box score
+    df2 = backtest_games(tg, [2025], player_games=pg2)
+    row = df2[df2['game_id'] == first['game_id']].iloc[0]
+    assert row['pred_margin'] == pytest.approx(first['pred_margin'])
+
+
+def test_lineup_delta_skipped_in_playoffs(league_conn):
+    tg, pg = _frames(league_conn)
+    tg.loc[tg['game_id'] == tg['game_id'].iloc[-1], 'season_type'] = 'Playoffs'
+    df = backtest_games(tg, [2025], player_games=pg)
+    assert df.loc[df['season_type'] == 'Playoffs', 'lineup_diff'].eq(0).all()
+
+
+def test_star_out_lowers_margin(league_conn):
+    ctx = GameContext(league_conn, '2026-02-01')
+    roster = ctx.roster('BOS')
+    assert len(roster) == 2 and roster['value'].is_monotonic_decreasing
+    star = int(roster['player_id'].iloc[0])
+    full = ctx.evaluate('BOS', 'LAL')
+    hurt = ctx.evaluate('BOS', 'LAL', home_out=[star])
+    assert hurt['margin'] < full['margin'] - 1
+    assert hurt['p_home_win'] < full['p_home_win']
+    assert hurt['total'] == pytest.approx(full['total'])
+    assert hurt['adjustments']['lineup'] < 0
+    assert resolve_out(ctx, 'BOS', [roster['player_name'].iloc[0]]) == [star]
+
+
+def test_fit_coefs_recovers_known_values():
+    rng = np.random.default_rng(1)
+    n = 3000
+    df = pd.DataFrame({'rating_margin': rng.normal(0, 6, n), 'b2b_diff': rng.integers(-1, 2, n),
+                       'lineup_diff': rng.normal(0, 10, n)})
+    df['act_margin'] = 1.2 * df['rating_margin'] + 3 * df['b2b_diff'] + 0.15 * df['lineup_diff'] \
+        + rng.normal(0, 12, n)
+    coefs, sd = fit_coefs(df)
+    assert coefs['scale'] == pytest.approx(1.2, abs=0.1)
+    assert coefs['b2b'] == pytest.approx(3, abs=1)
+    assert coefs['lineup'] == pytest.approx(0.15, abs=0.04)
+    assert sd == pytest.approx(12, abs=0.6)
+    # out-of-range fits are clipped; no player data -> no lineup term
+    df['act_margin'] = -df['rating_margin']
+    df['lineup_diff'] = 0.0
+    coefs, _ = fit_coefs(df)
+    assert coefs['scale'] == COEF_BOUNDS['scale'][0] and coefs['lineup'] == 0
+
+
+def test_calibrate_stores_coefs(league_conn):
+    sd_m, sd_t, n, coefs = calibrate(league_conn, min_games=10)
+    assert n > 10 and sd_m > 0 and set(coefs) == {'scale', 'b2b', 'lineup'}
+    assert stored_coefs(league_conn) == pytest.approx(coefs)
