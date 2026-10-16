@@ -116,6 +116,7 @@ are discretized normals) from the most recent ~1,500 walk-forward predictions.
 python backtest.py props --seasons 2025
 python backtest.py props --tune 2024 --seasons 2025       # tune on one season, report on another
 python backtest.py games --seasons 2024 2025
+python backtest.py calibrate --season 2025              # each offseason: refit per-stat spread + P(over) fix, paste output into code
 ```
 
 Walk-forward: every prediction uses only earlier games. Results on 2023-24 (parameters tuned

@@ -16,6 +16,7 @@ Usage:
     python backtest.py props --seasons 2024 2025 --stats PTS REB AST FG3M PRA
     python backtest.py props --tune 2024 --seasons 2025     # tune on 2024, report on 2025
     python backtest.py games --seasons 2024 2025
+    python backtest.py calibrate --season 2025              # refit per-stat dispersion + P(over) fix
 """
 
 import argparse
@@ -24,6 +25,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 from scipy import stats as sps
+from scipy.optimize import minimize, minimize_scalar
 
 from db import connect
 from feature_engineering import (STATS, PropParams, league_priors, opponent_factors,
@@ -47,14 +49,22 @@ def load(conn):
 # Props
 # ---------------------------------------------------------------------------
 
-def predict_props(pg, tga, season, stats, params, min_season_games=5):
-    """One row per (player-game in `season`, stat) with model + baseline predictions."""
+def season_priors(pg, season):
     prior_data = pg[pg['season'] < season]
     if prior_data.empty:
         raise ValueError(f"Need at least one season before {season} for league priors")
-    priors = league_priors(prior_data[prior_data['season'] >= season - 2])
+    return league_priors(prior_data[prior_data['season'] >= season - 2])
+
+
+def predict_props(pg, tga, season, stats, params, min_season_games=5, priors=None, player_ids=None):
+    """One row per (player-game in `season`, stat) with model + baseline predictions.
+    `player_ids` restricts to some players (for parallel runs; pass the full-league `priors`)."""
+    if priors is None:
+        priors = season_priors(pg, season)
     lo = season - params.lookback_seasons + 1
     pool = pg[(pg['season'] >= lo) & (pg['season'] <= season)]
+    if player_ids is not None:
+        pool = pool[pool['player_id'].isin(player_ids)]
     opp_cache = {}
     rows = []
     for pid, g in pool.groupby('player_id', sort=False):
@@ -94,7 +104,7 @@ def evaluate_props(df):
         mu, var = s['mean'].to_numpy(), s['var'].to_numpy()
         line = np.floor(s['season_avg'].to_numpy()) + 0.5          # proxy book line
         hit = (y > line).astype(float)
-        p_over = np.array([line_probs(m, v, L)[0] for m, v, L in zip(mu, var, line)])
+        p_over = np.array([line_probs(m, v, L, stat)[0] for m, v, L in zip(mu, var, line)])
         old_sd = OLD_SD.get(stat, 5.5)
         p_old = sps.norm.cdf((s['old'].to_numpy() - line) / old_sd)
         # distribution-level checks
@@ -142,7 +152,6 @@ TUNE_GRID = {
     'prev_season_weight': [0.4, 0.6, 0.8],
     'opp_strength': [0.0, 0.5, 1.0],
     'disp_prior_games': [5, 10, 20],
-    'var_scale': [1.15, 1.3, 1.45],
 }
 
 _W = {}
@@ -172,6 +181,95 @@ def tune_props(season, stats, jobs=4):
             best = cands[int(np.argmax(scores))]
             print(f"  -> {key} = {getattr(best, key)}")
     return best
+
+
+# ---------------------------------------------------------------------------
+# Calibration: per-stat dispersion (VAR_SCALE) and P(over) recalibration (P_OVER_CAL)
+# ---------------------------------------------------------------------------
+
+def _nb(mu, var):
+    mu = np.maximum(mu, 1e-6)
+    var = np.maximum(var, mu * (1 + 1e-6))
+    n = mu ** 2 / (var - mu)
+    return n, n / (n + mu)
+
+
+def _logit(p):
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+
+def _cal_predict(pids):
+    return predict_props(_W['pg'], _W['tga'], _W['season'], _W['stats'], PropParams(var_scale=1.0),
+                         priors=_W['priors'], player_ids=pids)
+
+
+def fit_calibration(df):
+    """df: predict_props rows made with var_scale=1.0. Returns ({stat: var_scale}, {stat: (a, b)}).
+    Dispersion is fit first (log-likelihood of the whole distribution), then the logistic
+    P(over) fix on top of it at the proxy line (season-to-date average rounded to x.5)."""
+    scales, cal = {}, {}
+    for stat, s in df.groupby('stat', sort=False):
+        mu, y = s['mean'].to_numpy(), s['actual'].to_numpy()
+        alpha1 = (s['var'].to_numpy() - mu) / np.maximum(mu, 1e-6) ** 2
+
+        def nll(k):
+            return -sps.nbinom.logpmf(y, *_nb(mu, mu + k * alpha1 * mu ** 2)).mean()
+        k = float(minimize_scalar(nll, bounds=(0.1, 3.0), method='bounded').x)
+        line = np.floor(s['season_avg'].to_numpy()) + 0.5
+        x = _logit(sps.nbinom.sf(np.floor(line), *_nb(mu, mu + k * alpha1 * mu ** 2)))
+        hit = (y > line).astype(float)
+
+        def logloss(w):
+            z = w[0] + w[1] * x
+            return np.mean(np.logaddexp(0, z) - hit * z)
+        a, b = minimize(logloss, [0.0, 1.0]).x
+        scales[stat], cal[stat] = round(k, 3), (round(float(a), 3), round(float(b), 3))
+    return scales, cal
+
+
+def calibration_check(df, scales, cal):
+    """Mean P(over) raw vs recalibrated vs actual, and Brier, at the proxy line."""
+    out = []
+    for stat, s in df.groupby('stat', sort=False):
+        mu, y = s['mean'].to_numpy(), s['actual'].to_numpy()
+        var = mu + scales[stat] * (s['var'].to_numpy() - mu)
+        line = np.floor(s['season_avg'].to_numpy()) + 0.5
+        p_raw = sps.nbinom.sf(np.floor(line), *_nb(mu, var))
+        a, b = cal[stat]
+        p_cal = 1 / (1 + np.exp(-(a + b * _logit(p_raw))))
+        hit = (y > line).astype(float)
+        out.append({'stat': stat, 'n': len(s), 'actual_over': hit.mean(), 'p_raw': p_raw.mean(),
+                    'p_cal': p_cal.mean(), 'brier_raw': np.mean((p_raw - hit) ** 2),
+                    'brier_cal': np.mean((p_cal - hit) ** 2)})
+    return pd.DataFrame(out)
+
+
+def calibrate_props(season, stats, jobs=4):
+    """Walk-forward predictions for `season`, then fit VAR_SCALE and P_OVER_CAL on them.
+    Sanity check first: fit on the first half of the season, score the second half."""
+    from multiprocessing import Pool
+    pg, _ = load(connect())
+    pids = pg.loc[pg['season'] == season, 'player_id'].unique()
+    chunks = [pids[i::jobs * 4] for i in range(jobs * 4)]
+    with Pool(jobs, initializer=_tune_init_cal, initargs=(season, stats)) as pool:
+        df = pd.concat(pool.map(_cal_predict, chunks), ignore_index=True)
+
+    mid = df['game_date'].sort_values().iloc[len(df) // 2]
+    first, second = df[df['game_date'] < mid], df[df['game_date'] >= mid]
+    print(f"\nHold-out check: fit on games before {mid}, scored on games from {mid} on")
+    print(calibration_check(second, *fit_calibration(first)).to_string(index=False,
+                                                                       float_format=lambda x: f'{x:.3f}'))
+    scales, cal = fit_calibration(df)
+    print(f"\nFitted on all of {season}. Paste into the code:\n")
+    print(f"# feature_engineering.py\nVAR_SCALE = {scales}\n")
+    print(f"# projection_model.py\nP_OVER_CAL = {cal}")
+    return scales, cal
+
+
+def _tune_init_cal(season, stats):
+    _tune_init(season, stats)
+    _W['priors'] = season_priors(_W['pg'], season)
 
 
 # ---------------------------------------------------------------------------
@@ -226,13 +324,22 @@ def run_games(tg, seasons, params=None, pg=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['props', 'games'])
-    ap.add_argument('--seasons', type=int, nargs='+', required=True)
+    ap.add_argument('mode', choices=['props', 'games', 'calibrate'])
+    ap.add_argument('--seasons', type=int, nargs='+')
+    ap.add_argument('--season', type=int, help='season to fit on (calibrate only)')
     ap.add_argument('--stats', nargs='+', default=DEFAULT_STATS)
     ap.add_argument('--tune', type=int, help='season to tune parameters on (props only)')
     ap.add_argument('--jobs', type=int, default=4, help='parallel workers for --tune')
     ap.add_argument('--csv', help='write per-prediction rows to this CSV')
     a = ap.parse_args()
+    if a.mode == 'calibrate':
+        if a.season is None:
+            ap.error('calibrate needs --season')
+        stats = list(STATS) if a.stats == DEFAULT_STATS else a.stats
+        calibrate_props(a.season, stats, jobs=a.jobs)
+        return
+    if not a.seasons:
+        ap.error('--seasons is required')
 
     conn = connect()
     pg, tg = load(conn)

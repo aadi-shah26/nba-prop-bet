@@ -11,14 +11,14 @@ Model for a player's stat in one game (all inputs strictly before the game):
     mean          = sum over components c of  minutes_proj * rate_c * opp_factor_c ** opp_strength
     variance      = mean + alpha * mean**2   (negative binomial "NB2"), where alpha is the
                     player's own over-dispersion of the stat, shrunk toward the league value
-                    and scaled by var_scale (calibrated in the backtest)
+                    and scaled by a per-stat var_scale (fit by `python backtest.py calibrate`)
 
 Combo stats (PRA, PR, ...) are built from their components so each component gets
 its own opponent adjustment; dispersion is measured on the combo series itself so the
 correlation between components is captured.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 import numpy as np
 import pandas as pd
@@ -58,6 +58,13 @@ def parse_stat(s):
     return key
 
 
+# Per-stat multiplier on the over-dispersion, fit by log-likelihood on the previous season
+# (python backtest.py calibrate --season YYYY). Small counts need far less extra spread than points.
+# Fit on 2025-26.
+VAR_SCALE = {'PTS': 1.28, 'REB': 0.913, 'AST': 0.779, 'STL': 0.464, 'BLK': 0.468, 'TOV': 0.326,
+             'FG3M': 0.749, 'PRA': 1.176, 'PR': 1.189, 'PA': 1.218, 'RA': 0.98, 'SB': 0.663}
+
+
 @dataclass
 class PropParams:
     # Defaults tuned walk-forward on 2022-23 (mean log-likelihood), checked on 2021-22 and 2023-24.
@@ -68,7 +75,8 @@ class PropParams:
     max_games: int = 160               # older games have negligible weight anyway
     rate_prior_minutes: float = 60.0   # pseudo-minutes of league-average production
     disp_prior_games: float = 10.0     # pseudo-games of league over-dispersion
-    var_scale: float = 1.3             # multiplier on over-dispersion (calibration)
+    # multiplier on over-dispersion: {stat: scale} (stats not listed use 1.0), or one float for all
+    var_scale: dict = field(default_factory=lambda: dict(VAR_SCALE))
     opp_half_life: float = 30.0        # games (per team)
     opp_prior_games: float = 15.0      # pseudo-games of league average for opponent factors
     opp_strength: float = 1.0          # exponent on opponent factor (0 = ignore opponent)
@@ -222,7 +230,9 @@ def project_from_history(hist, stat, target_season, priors, params,
     a_prior = priors['alpha'][stat]
     a_player = (y_var - y_mean) / y_mean ** 2 if y_mean > 0 else a_prior
     n0 = params.disp_prior_games
-    alpha = max((n_eff * a_player + n0 * a_prior) / (n_eff + n0), 0.0) * params.var_scale
+    vs = params.var_scale
+    alpha = max((n_eff * a_player + n0 * a_prior) / (n_eff + n0), 0.0) * \
+        (vs.get(stat, 1.0) if isinstance(vs, dict) else vs)
     var = mean + alpha * mean ** 2
 
     cur = hist[hist['season'] == target_season]

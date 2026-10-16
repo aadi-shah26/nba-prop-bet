@@ -39,3 +39,17 @@ def test_fair_line_is_near_even():
         for other in (L - 1, L + 1):
             if other > 0:
                 assert abs(o - 0.5) <= abs(line_probs(mean, var, other)[0] - 0.5) + 1e-12
+
+
+def test_over_recalibration(monkeypatch):
+    import projection_model
+    monkeypatch.setattr(projection_model, 'P_OVER_CAL', {'PTS': (0.15, 0.9)})
+    raw = line_probs(25.0, 60.0, 24.5)
+    cal = line_probs(25.0, 60.0, 24.5, 'PTS')
+    assert cal[0] > raw[0] and sum(cal) == pytest.approx(1)
+    # integer line: push probability is untouched, the rest is re-split
+    raw, cal = line_probs(25.0, 60.0, 25), line_probs(25.0, 60.0, 25, 'PTS')
+    assert cal[2] == pytest.approx(raw[2]) and sum(cal) == pytest.approx(1)
+    assert cal[0] > raw[0]
+    # stats without coefficients are unchanged
+    assert line_probs(4.0, 6.0, 3.5, 'REB') == line_probs(4.0, 6.0, 3.5)

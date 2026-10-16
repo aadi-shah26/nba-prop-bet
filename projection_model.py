@@ -36,8 +36,29 @@ def count_distribution(mean, var):
     return sps.nbinom(n, n / (n + mean))
 
 
-def line_probs(mean, var, line):
-    """(p_over, p_under, p_push) for an integer-valued stat against `line`."""
+# The negative binomial is more right-skewed than real box scores, so its raw P(over) runs low
+# (about 4 points on PTS and combos at lines near the median). Per-stat logistic fix,
+#     p = sigmoid(a + b * logit(p_raw)),
+# fit on the previous season with `python backtest.py calibrate --season YYYY`. Refit each offseason.
+# Fit on 2025-26 (raw P(over) vs actual on PTS was 42.2% vs 46.4% out of sample; 45.4% after).
+P_OVER_CAL = {'PTS': (0.138, 0.927), 'REB': (0.001, 0.875), 'AST': (-0.023, 0.91),
+              'STL': (-0.046, 0.888), 'BLK': (-0.07, 0.94), 'TOV': (-0.035, 0.915),
+              'FG3M': (0.018, 1.173), 'PRA': (0.136, 0.939), 'PR': (0.133, 0.951),
+              'PA': (0.142, 0.931), 'RA': (0.053, 0.93), 'SB': (-0.026, 0.888)}
+
+
+def calibrate_over(p, stat):
+    """Recalibrated P(over | not a push) for `stat`; unchanged for stats without coefficients."""
+    if stat not in P_OVER_CAL:
+        return p
+    a, b = P_OVER_CAL[stat]
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return 1.0 / (1.0 + math.exp(-(a + b * math.log(p / (1 - p)))))
+
+
+def line_probs(mean, var, line, stat=None):
+    """(p_over, p_under, p_push) for an integer-valued stat against `line`.
+    Pass `stat` to apply the P(over) recalibration (always do this for betting decisions)."""
     if mean <= 0:
         return (0.0, 0.0, 1.0) if line == 0 else (0.0, 1.0, 0.0) if line > 0 else (1.0, 0.0, 0.0)
     dist = count_distribution(mean, var)
@@ -49,16 +70,20 @@ def line_probs(mean, var, line):
     else:
         p_push = 0.0
         p_under = float(dist.cdf(fl))
+    decided = p_over + p_under
+    if stat is not None and decided > 0:
+        q = calibrate_over(p_over / decided, stat)
+        p_over, p_under = q * decided, (1 - q) * decided
     return p_over, p_under, p_push
 
 
-def fair_line(mean, var):
+def fair_line(mean, var, stat=None):
     """The x.5 line closest to a 50/50 split (what the 'right' book line would be)."""
     if mean <= 0:
         return 0.5
     m = int(count_distribution(mean, var).ppf(0.5))
-    cands = [c for c in (m - 0.5, m + 0.5) if c > 0]
-    return min(cands, key=lambda c: abs(line_probs(mean, var, c)[0] - 0.5))
+    cands = [c for c in (m - 1.5, m - 0.5, m + 0.5, m + 1.5) if c > 0]
+    return min(cands, key=lambda c: abs(line_probs(mean, var, c, stat)[0] - 0.5))
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +137,7 @@ class PropContext:
             res.update(player_id=int(player_id), player_name=last['player_name'],
                        team=last['team'], last_game=last['game_date'],
                        opponent=team_abbr(opponent) if opponent else None,
-                       fair_line=fair_line(res['mean'], res['var']))
+                       fair_line=fair_line(res['mean'], res['var'], res['stat']))
         return res
 
 
@@ -152,7 +177,7 @@ def print_projection(p, line=None):
         [p['fair_line'] + d for d in (-3, -2, -1, 0, 1, 2, 3) if p['fair_line'] + d > 0]
     print(f"\n{'Line':>7} {'P(over)':>9} {'P(under)':>9} {'P(push)':>8}")
     for L in lines:
-        o, u, ps = line_probs(p['mean'], p['var'], L)
+        o, u, ps = line_probs(p['mean'], p['var'], L, stat)
         print(f"{L:>7} {o:>9.1%} {u:>9.1%} {ps:>8.1%}")
     print()
 

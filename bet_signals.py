@@ -35,7 +35,7 @@ def evaluate_prop(ctx, player_id, stat, line, over_odds=-110, under_odds=-110,
     p = ctx.project(player_id, stat, opponent=opponent, minutes=minutes)
     if p is None:
         return None
-    p_over, p_under, p_push = line_probs(p['mean'], p['var'], line)
+    p_over, p_under, p_push = line_probs(p['mean'], p['var'], line, stat)
     fair_over, fair_under, vig = no_vig_probs(over_odds, under_odds)
     pick, ev_over, ev_under = decide(p_over, p_under, over_odds, under_odds, min_ev)
     pick = {'A': 'OVER', 'B': 'UNDER'}.get(pick, 'PASS')

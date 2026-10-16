@@ -90,3 +90,14 @@ def test_league_priors(league_conn):
     pr = league_priors(pg)
     assert pr['rate']['pts'] == pytest.approx(pg['pts'].sum() / pg['minutes'].sum())
     assert all(a >= 0 for a in pr['alpha'].values())
+
+
+def test_var_scale_per_stat():
+    rng = np.random.default_rng(2)
+    h = _hist(40, rng.poisson(24, 40))
+    lo = project_from_history(h, 'PTS', 2025, PRIORS, PropParams(var_scale={'PTS': 0.5}))
+    hi = project_from_history(h, 'PTS', 2025, PRIORS, PropParams(var_scale={'PTS': 2.0}))
+    flat = project_from_history(h, 'PTS', 2025, PRIORS, PropParams(var_scale=2.0))
+    assert lo['mean'] == pytest.approx(hi['mean'])
+    assert hi['alpha'] == pytest.approx(4 * lo['alpha'])
+    assert flat['alpha'] == pytest.approx(hi['alpha'])
