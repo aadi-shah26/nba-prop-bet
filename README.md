@@ -43,9 +43,11 @@ starter out who will push this player's minutes up.
 Stats: points, rebounds, assists, 3-pointers made, PRA, PR, PA, RA, steals, blocks,
 steals+blocks, turnovers.
 
-**Games** — choose away and home team (their logos appear once both are picked). Leave the
-lines blank to just get the predicted score and win probability, or fill in any of spread (the
-**home** team's line), total and moneyline to get a pick for each. Once both teams are picked, a **who's playing tonight** checklist
+**Games** — the day's games are listed at the top (from the NBA schedule, refreshed
+automatically), each with the model's predicted winner. Click **Open** on one to load it, or
+add a custom matchup (their logos appear once loaded). Leave the lines blank to just get the
+predicted score and win probability, or fill in any of spread (the **home** team's line), total
+and moneyline to get a pick for each. Once a game is open, a **who's playing tonight** checklist
 appears for each team (best players first; check the injury report). Everyone from the team's
 last 10 games starts ticked, so untick anyone who's out. Players who haven't played lately
 (injured, out of the rotation) start unticked, so tick anyone returning. The result shows the
@@ -199,7 +201,8 @@ and rest (projections lag sudden role changes — April is the weakest month), t
 |---|---|
 | `app.py`, `start.command` | The web app and its Mac launcher |
 | `fetch_game_logs.py` | League-wide player + team game logs from stats.nba.com |
-| `daily_update.py` | Refresh current season, settle logged bets, recalibrate game model |
+| `daily_update.py` | Refresh current season, settle logged bets, recalibrate game model, refresh schedule |
+| `nba_schedule.py` | Season schedule incl. upcoming games (for the Game tab's list of today's games) |
 | `feature_engineering.py` | Shared numeric core (rates, minutes, opponent factors, dispersion) |
 | `projection_model.py` | Distributions, fair lines, projection CLI |
 | `bet_signals.py` | Prop evaluator, prop log, settlement, report |

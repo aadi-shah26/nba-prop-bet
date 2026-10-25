@@ -424,7 +424,8 @@ class GameContext:
         self.use_lineups = not (tg['season'].max() == self.season and latest_type not in LINEUP_SEASON_TYPES)
         pg = pd.read_sql_query("SELECT * FROM player_games WHERE season >= ? AND game_date < ?",
                                conn, params=(lo, self.game_date))
-        self._rosters, self._lineup_ref = {}, {}
+        self._rosters, self._lineup_ref, self._departed = {}, {}, {}
+        self.roster_date = None
         if not pg.empty:
             vals = player_values(pg, self.params)
             lh = lineup_history(vals, self.params)
@@ -432,26 +433,89 @@ class GameContext:
             latest = vals.groupby('player_id').tail(1).copy()
             d = pd.to_datetime(latest['game_date'])
             latest['season'] = np.where(d.dt.month >= 8, d.dt.year, d.dt.year - 1)
+            # players who appeared in their team's last few games (at the time)
+            active = {}
             for team, g in vals.groupby('team'):
                 recent = g['game_id'].drop_duplicates().iloc[-self.params.roster_recent_games:]
-                ids = set(g.loc[g['game_id'].isin(recent), 'player_id'])
-                mine = latest[latest['team'] == team]
-                # also this season's players who haven't played lately (injured, out of the
-                # rotation) so they can be marked as playing when they return
-                r = mine[mine['player_id'].isin(ids) | (mine['season'] == mine['season'].max())]
-                self._rosters[team] = (r[['player_id', 'player_name', 'val_post', 'game_date']]
-                                       .rename(columns={'val_post': 'value', 'game_date': 'last_game'})
-                                       .assign(recent=r['player_id'].isin(ids).to_numpy())
-                                       .sort_values(['recent', 'value'], ascending=False)
-                                       .reset_index(drop=True))
+                active[team] = set(g.loc[g['game_id'].isin(recent), 'player_id'])
+            current = self._current_rosters(conn)
+            if current is not None:
+                # today's rosters say who is on each team; a player counts as recent if he was in
+                # his team's rotation lately, whichever team that was (offseason moves, trades)
+                ids = set().union(*active.values())
+                latest = latest.set_index('player_id')
+                for team, r in current.groupby('team'):
+                    r = r[r['player_id'].isin(latest.index)]  # rookies etc.: no games, no value yet
+                    rows = latest.loc[r['player_id']].reset_index()
+                    self._rosters[team] = self._roster_frame(rows, rows['player_id'].isin(ids))
+                # rotation players who have left each team since (for explanations)
+                now_team = dict(zip(current['player_id'], current['team']))
+                for team, team_ids in active.items():
+                    gone = [i for i in team_ids if now_team.get(i) != team and i in latest.index]
+                    self._departed[team] = (latest.loc[gone, ['player_name', 'val_post']]
+                                            .rename(columns={'val_post': 'value'})
+                                            .assign(now_team=[now_team.get(i) for i in gone])
+                                            .sort_values('value', ascending=False).reset_index(drop=True))
+            else:
+                for team, ids in active.items():
+                    mine = latest[latest['team'] == team]
+                    # also this season's players who haven't played lately (injured, out of the
+                    # rotation) so they can be marked as playing when they return
+                    r = mine[mine['player_id'].isin(ids) | (mine['season'] == mine['season'].max())]
+                    self._rosters[team] = self._roster_frame(r, r['player_id'].isin(ids))
+
+    @staticmethod
+    def _roster_frame(rows, recent):
+        return (rows[['player_id', 'player_name', 'val_post', 'game_date', 'team']]
+                .rename(columns={'val_post': 'value', 'game_date': 'last_game', 'team': 'last_team'})
+                .assign(recent=np.asarray(recent))
+                .sort_values(['recent', 'value'], ascending=False)
+                .reset_index(drop=True))
+
+    def _current_rosters(self, conn):
+        """Stored rosters for this season, if they were fetched on or before the game date (so
+        a past game is never evaluated with players who joined later). Sets self.roster_date."""
+        try:
+            df = pd.read_sql_query("SELECT team, player_id, fetched_at FROM rosters WHERE season = ?",
+                                   conn, params=(self.season,))
+        except Exception:  # database from before the rosters table existed
+            return None
+        if df.empty:
+            return None
+        # fetched_at is UTC, a day ahead of US time in the evening
+        fetched = (pd.Timestamp(df['fetched_at'].max()).tz_convert(None) - pd.Timedelta(hours=8)).strftime('%Y-%m-%d')
+        if fetched > self.game_date:
+            return None
+        self.roster_date = fetched
+        return df
 
     def roster(self, team):
-        """The team's players, best first: player_id, player_name, value, last_game, and recent
-        (True = appeared in the team's last few games, so assumed to play unless marked out).
-        Empty if there is no player data."""
+        """The team's players, best first: player_id, player_name, value, last_game, last_team
+        (who he last played for), and recent (True = appeared in his team's last few games, so
+        assumed to play unless marked out). Empty if there is no player data."""
         r = self._rosters.get(team_abbr(team) or team)
         return r.copy() if r is not None else pd.DataFrame(
-            columns=['player_id', 'player_name', 'value', 'last_game', 'recent'])
+            columns=['player_id', 'player_name', 'value', 'last_game', 'last_team', 'recent'])
+
+    def lineup_changes(self, team, out=(), extra=(), n=3, min_value=5.0):
+        """The players behind a team's lineup adjustment, best first (rotation-level only):
+        added (joined since he last played, with the team he came from), lost (left the team's
+        recent rotation, with where he is now), out (marked out tonight), back (marked back in).
+        Each is a list of (name, other team or None)."""
+        r = self._rosters.get(team)
+        res = {'added': [], 'lost': [], 'out': [], 'back': []}
+        if r is None:
+            return res
+        out, extra = set(out), set(extra)
+        big = r[r['value'] >= min_value]
+        add = big[big['recent'] & (big['last_team'] != team) & ~big['player_id'].isin(out)]
+        res['added'] = [(x.player_name, x.last_team) for x in add.head(n).itertuples()]
+        gone = self._departed.get(team)
+        if gone is not None:
+            res['lost'] = [(x.player_name, x.now_team) for x in gone[gone['value'] >= min_value].head(n).itertuples()]
+        res['out'] = [(x.player_name, None) for x in r[r['recent'] & r['player_id'].isin(out)].head(n).itertuples()]
+        res['back'] = [(x.player_name, None) for x in r[~r['recent'] & r['player_id'].isin(extra)].head(n).itertuples()]
+        return res
 
     def lineup_delta(self, team, out=(), extra=()):
         """Tonight's lineup strength vs the team's recent norm. Recent players play unless in
@@ -669,6 +733,129 @@ def adjustment_text(pred):
     if pred['b2b_home'] or pred['b2b_away']:
         parts[-1] += f" ({pred['adjustments']['b2b']:+.1f} for {h})"
     return ', '.join(parts)
+
+
+def explain_pick(pred, ratings):
+    """Why the model picks its winner: (favorite, margin, [(kind, pts toward the favorite)]),
+    biggest first, kind in 'strength' | 'home' | 'rest' | 'lineup'. The points add up to the
+    margin: team ratings and home court are split out of the rating margin (both stretched by
+    the scale adjustment), then the back-to-back and lineup adjustments. Parts under 0.3 pts
+    are dropped. `ratings` is GameContext.ratings."""
+    ad = pred['adjustments']
+    scale = 1 + ad['scale'] / pred['rating_margin'] if pred['rating_margin'] else 1.0
+    hca = ratings['margin']['hca_pts'] * scale
+    parts = [('strength', pred['rating_margin'] + ad['scale'] - hca), ('home', hca),
+             ('rest', ad['b2b']), ('lineup', ad['lineup'])]   # pts toward home
+    fav, sign = (pred['home'], 1) if pred['margin'] >= 0 else (pred['away'], -1)
+    parts = [(k, sign * p) for k, p in parts if abs(p) >= 0.3]
+    return fav, abs(pred['margin']), sorted(parts, key=lambda x: -abs(x[1]))
+
+
+def _ordinal(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def _names(players, with_team=None):
+    """'LeBron James (from LAL), Paul George (from PHI)'."""
+    return ', '.join(f"{name} ({with_team} {t})" if with_team and t else name for name, t in players)
+
+
+def explain_game(ctx, pred, home_out=(), away_out=(), home_in=(), away_in=()):
+    """Plain-English reasons for a prediction: {'summary': one sentence,
+    'details': [markdown lines]}. Pass the same lineup choices as GameContext.evaluate."""
+    h, a = pred['home'], pred['away']
+    R = ctx.ratings['margin']
+    T = R['teams']
+    fav, margin, parts = explain_pick(pred, ctx.ratings)
+    dog = a if fav == h else h
+    pts = dict(parts)
+    p_fav = pred['p_home_win'] if fav == h else 1 - pred['p_home_win']
+
+    net = {t: T[t]['off'] - T[t]['def'] for t in (h, a)}
+    better, worse = (h, a) if net[h] >= net[a] else (a, h)
+    gap = net[better] - net[worse]
+    period = "last season" if season_for_date(R['last_game']) < ctx.season else "this season"
+    off_rank = {t: i + 1 for i, t in enumerate(sorted(T, key=lambda t: -T[t]['off']))}
+    def_rank = {t: i + 1 for i, t in enumerate(sorted(T, key=lambda t: T[t]['def']))}
+
+    changes = {h: ctx.lineup_changes(h, home_out, home_in), a: ctx.lineup_changes(a, away_out, away_in)}
+    lineup_for = None
+    if 'lineup' in pts:
+        lineup_for = fav if pts['lineup'] > 0 else dog
+    rested = [t for t, b in ((h, pred['b2b_home']), (a, pred['b2b_away'])) if b]
+
+    # --- one-sentence summary: reasons for the favorite, then the ones against
+    def lineup_reasons(t):
+        other = dog if t == fav else fav
+        c, o = changes[t], changes[other]
+        # tonight's news first, then offseason / trade moves
+        bits = ([f"{_names(o['out'][:2])} out for {other}"] if o['out'] else []) + \
+               ([f"{_names(c['back'][:2])} back"] if c['back'] else []) + \
+               ([f"added {' and '.join(n for n, _ in c['added'][:2])}"] if c['added'] else []) + \
+               ([f"{other} lost {o['lost'][0][0]}"] if o['lost'] else [])
+        return f" ({'; '.join(bits[:2])})" if bits else ""
+
+    def phrase(kind):
+        if kind == 'strength':
+            word = 'a little' if gap < 3 else 'clearly' if gap < 6 else 'much'
+            return f"{better} was {word} better {period}"
+        if kind == 'home':
+            return f"{h} plays at home"
+        if kind == 'rest':
+            return f"{' and '.join(rested)} played yesterday"
+        return f"lineup changes favor {lineup_for}{lineup_reasons(lineup_for)}"
+
+    def join(phrases):
+        """'NYK was better and NYK plays at home' -> '... and plays at home'."""
+        out = []
+        for i, ph in enumerate(phrases):
+            prev = phrases[i - 1].split(' ')[0] if i else None
+            out.append(ph[len(prev) + 1:] if prev and ph.split(' ')[0] == prev and prev in (h, a) else ph)
+        return ' and '.join(out)
+    even = gap < 1
+    pro = [phrase(k) for k, p in parts if p > 0 and not (k == 'strength' and even)]
+    con = [phrase(k) for k, p in parts if p < 0 and not (k == 'strength' and even)]
+    lead = f"Close to a toss-up, slight edge {fav}" if margin < 2 else f"{fav} is the pick"
+    reasons = ([f"the teams rated about even {period}"] if even else []) + ([join(pro)] if pro else [])
+    summary = lead + (": " + ", and ".join(reasons) if reasons else "")
+    if con:
+        summary += (", although " if reasons else ": ") + join(con)
+    summary += "."
+
+    # --- details
+    def team_line(t):
+        return (f"{t} net {net[t]:+.1f} (offense {T[t]['off']:.1f}, {_ordinal(off_rank[t])}; "
+                f"defense {T[t]['def']:.1f}, {_ordinal(def_rank[t])})")
+    fmt = lambda k: f"`{pts[k]:+.1f}`" if k in pts else "`±0`"
+    details = [f"**Team strength** {fmt('strength')}: {team_line(better)} vs {team_line(worse)}, per 100 "
+               f"possessions, from games through {R['last_game']} (recent games count most)."]
+    if ctx.use_lineups:
+        bits = []
+        for t in (a, h):
+            c = changes[t]
+            if c['added']:
+                bits.append(f"{t} added {_names(c['added'][:2], 'from')}")
+            if c['lost']:
+                bits.append(f"{t} lost {_names(c['lost'][:2], 'now')}")
+            if c['out']:
+                bits.append(f"{t} without {_names(c['out'])} tonight")
+            if c['back']:
+                bits.append(f"{t} gets back {_names(c['back'])}")
+        who = f", favoring {lineup_for}" if lineup_for else ""
+        if bits and not lineup_for:
+            bits[-1] += "; these roughly cancel out"
+        details.append(f"**Lineups** {fmt('lineup')}{who}: " + ("; ".join(bits) + ". " if bits else "")
+                       + "Compares each team's top 8 tonight with its usual strength.")
+    else:
+        details.append("**Lineups**: not used in the playoffs (it made playoff picks worse in testing).")
+    details.append(f"**Home court** {fmt('home')}: home teams have won by {R['hca_pts']:.1f} pts on average.")
+    details.append(f"**Rest** {fmt('rest')}: " + (f"{' and '.join(rested)} played yesterday." if rested
+                                                  else "neither team played yesterday."))
+    details.append(f"**Projected score**: {fav} {max(pred['pred_home'], pred['pred_away']):.0f}, "
+                   f"{dog} {min(pred['pred_home'], pred['pred_away']):.0f} (total {pred['total']:.0f}).")
+    details.append(f"**How sure**: real margins miss the prediction by about {ctx.sd_margin:.0f} pts either "
+                   f"way, so {'an' if f'{margin:.1f}'.startswith(('8', '11.', '18.')) else 'a'} {margin:.1f}-pt edge wins about {p_fav:.0%} of the time.")
+    return {'summary': summary, 'details': details}
 
 
 def resolve_out(ctx, team, names):

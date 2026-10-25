@@ -110,6 +110,35 @@ CREATE TABLE IF NOT EXISTS game_log (
     UNIQUE (game_date, home, away, market, line, odds_a, odds_b, book)
 );
 
+-- NBA schedule incl. future games (ScheduleLeagueV2), refreshed by the daily update and by the
+-- app when it's more than a few hours old. Lets the app list each day's games.
+CREATE TABLE IF NOT EXISTS schedule (
+    game_id    TEXT PRIMARY KEY,
+    game_date  TEXT    NOT NULL,   -- US Eastern date
+    season     INTEGER NOT NULL,
+    tip_utc    TEXT,
+    status     TEXT,               -- '7:30 pm ET' before tip-off, 'Final' after
+    home       TEXT    NOT NULL,
+    away       TEXT    NOT NULL,
+    label      TEXT,               -- e.g. 'East First Round · Game 3', 'Emirates NBA Cup'
+    fetched_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_date ON schedule(game_date);
+
+-- Current rosters (CommonTeamRoster), refreshed by the daily update. The game model uses them
+-- for who is on each team, so offseason moves count before those players have played.
+CREATE TABLE IF NOT EXISTS rosters (
+    season       INTEGER NOT NULL,
+    team         TEXT    NOT NULL,
+    player_id    INTEGER NOT NULL,
+    player_name  TEXT    NOT NULL,
+    position     TEXT,
+    how_acquired TEXT,              -- e.g. 'Traded from PHI on 07/06/26'
+    fetched_at   TEXT    NOT NULL,
+    PRIMARY KEY (season, player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rosters_team ON rosters(season, team);
+
 -- Small key/value store for calibrated model parameters (e.g. game-model residual SDs).
 CREATE TABLE IF NOT EXISTS model_params (
     key        TEXT PRIMARY KEY,

@@ -2,9 +2,11 @@
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 import db
+import nba_schedule
 import odds_fetcher
 from fetch_game_logs import ingest_frames
 from tests.conftest import make_league
@@ -24,8 +26,25 @@ def app_db(tmp_path, monkeypatch):
     for season, (p, t) in make_league().items():
         ingest_frames(conn, season, 'Regular Season', p, t)
     monkeypatch.setattr(db, 'DB_PATH', path)
+    # the schedule comes from the synthetic league instead of stats.nba.com
+    # (own connection: the app runs in another thread)
+    monkeypatch.setattr(nba_schedule, 'fetch_schedule', lambda season, timeout=30: fake_schedule(db.connect(path), season))
+    import streamlit as st
+    st.cache_data.clear()
     yield conn
     conn.close()
+
+
+def fake_schedule(conn, season):
+    """A ScheduleLeagueV2-shaped frame built from the league's home team-games."""
+    rows = conn.execute("SELECT game_id, game_date, team, opponent FROM team_games WHERE season=? AND home=1",
+                        (season,)).fetchall()
+    return pd.DataFrame([{
+        'gameId': gid, 'gameDate': f"{d[5:7]}/{d[8:10]}/{d[:4]} 00:00:00", 'gameDateTimeUTC': f"{d}T23:00:00Z",
+        'gameStatusText': 'Final', 'homeTeam_teamTricode': h, 'awayTeam_teamTricode': a,
+        'gameLabel': '', 'gameSubLabel': ''} for gid, d, h, a in rows],
+        columns=['gameId', 'gameDate', 'gameDateTimeUTC', 'gameStatusText', 'homeTeam_teamTricode',
+                 'awayTeam_teamTricode', 'gameLabel', 'gameSubLabel'])
 
 
 def _w(widgets, label):
@@ -61,9 +80,11 @@ def test_prop_and_game_flow(app_db):
     assert not at.exception and not at.error
     assert _bet_verdict(at, 'Over 18.5')                         # ~25 ppg scorer vs 18.5
 
+    at.date_input[1].set_value(date.fromisoformat(d))
     _w(at.selectbox, 'Away team').set_value(away)
     _w(at.selectbox, 'Home team').set_value(home)
-    at.date_input[1].set_value(date.fromisoformat(d))
+    _w(at.button, 'Load matchup').click()
+    at.run()
     _w(at.number_input, 'Home spread').set_value(-1.5)
     _w(at.number_input, 'Total points').set_value(220.5)
     _w(at.button, 'Evaluate game').click()
@@ -74,20 +95,64 @@ def test_prop_and_game_flow(app_db):
     assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 2
 
 
+def test_slate_opens_game(app_db):
+    d, home, away = _game_date(app_db)
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception
+    assert any('No games on' in c.value for c in at.caption)    # today isn't in the synthetic league
+    at.date_input[1].set_value(date.fromisoformat(d))
+    at.run()
+    assert any(f'<span>{away}</span>' in m.value and f'<span>{home}</span>' in m.value for m in at.markdown)
+    assert any(m.value.startswith('Model: **') for m in at.markdown)
+    assert any(e.label.startswith('Why ') for e in at.expander)
+    assert any('**Team strength**' in m.value for m in at.markdown)
+    gid = app_db.execute("SELECT game_id FROM schedule WHERE game_date=? AND home=?", (d, home)).fetchone()[0]
+    at.button(key=f'slate_{gid}').click()
+    at.run()
+    assert not at.exception and not at.error
+    assert any(b.label == 'Close' for b in at.button)                # the opened game's section
+    assert any(b.label == 'Evaluate game' for b in at.button)
+    assert any(f'{home} win chance' in m.value for m in at.markdown)
+    assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0   # no lines, nothing logged
+    _w(at.button, 'Close').click()
+    at.run()
+    assert not any(b.label == 'Evaluate game' for b in at.button)
+    assert not any(f'{home} win chance' in m.value for m in at.markdown)
+
+
+def test_slate_jumps_to_next_game_day(app_db):
+    first = app_db.execute("SELECT MIN(game_date) FROM team_games WHERE season=2025").fetchone()[0]
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    at.date_input[1].set_value(date(2025, 10, 1))
+    at.run()
+    _w(at.button, 'Go to next game day').click()
+    at.run()
+    assert not at.exception
+    assert at.date_input[1].value == date.fromisoformat(first)
+
+
 def test_validation_messages(app_db):
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
     _w(at.button, 'Evaluate prop').click()
     at.run()
     msgs = [e.value for e in at.error]
     assert 'Pick a player.' in msgs and 'Enter a line.' in msgs
+    _w(at.button, 'Load matchup').click()
+    at.run()
+    assert 'Pick both teams.' in [e.value for e in at.error]
     _w(at.selectbox, 'Away team').set_value('BOS')
     _w(at.selectbox, 'Home team').set_value('BOS')
+    _w(at.button, 'Load matchup').click()
+    at.run()
+    assert 'Home and away must be different teams.' in [e.value for e in at.error]
+    assert not any(b.label == 'Evaluate game' for b in at.button)    # nothing opened
+    _w(at.selectbox, 'Home team').set_value('LAL')
+    _w(at.button, 'Load matchup').click()
+    at.run()
     _w(at.number_input, 'Home ML').set_value(-150)
     _w(at.button, 'Evaluate game').click()
     at.run()
-    msgs = [e.value for e in at.error]
-    assert 'Home and away must be different teams.' in msgs
-    assert 'Enter both moneyline prices (or neither).' in msgs
+    assert 'Enter both moneyline prices (or neither).' in [e.value for e in at.error]
     assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0
 
 
@@ -197,6 +262,7 @@ def test_game_lineup_checklist(app_db):
     at.date_input[1].set_value(date.fromisoformat(d))
     _w(at.selectbox, 'Away team').set_value(away)
     _w(at.selectbox, 'Home team').set_value(home)
+    _w(at.button, 'Load matchup').click()
     at.run()
     box = at.checkbox(key=f"play_{home}_{star}_{d}")
     assert box.value is True                     # recent players start as playing
@@ -205,6 +271,9 @@ def test_game_lineup_checklist(app_db):
     at.run()
     assert not at.exception and not at.error
     assert any('lineups -' in c.value for c in at.caption)
+    # home star out: the explanation credits the lineup change to the away team
+    assert any(m.value.startswith('**Why:**') and f'lineup changes favor {away}' in m.value and 'out for' in m.value
+               for m in at.markdown)
 
 
 def test_track_this_and_tracked_tab(app_db):

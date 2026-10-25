@@ -20,10 +20,11 @@ import pandas as pd
 import streamlit as st
 
 from bet_signals import delete_prop, evaluate_prop, log_prop, prop_log_id, settle_prop_manual, untrack_prop
+import nba_schedule
 import odds_fetcher
 from db import DB_PATH, connect, get_meta, init_db, recent_players, season_for_date, set_meta
-from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate_markets, game_log_id,
-                        log_game_evals, settle_game_manual, stale_warning, untrack_game_bet)
+from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate_markets, explain_game,
+                        game_log_id, log_game_evals, settle_game_manual, stale_warning, untrack_game_bet)
 from projection_model import PropContext, count_distribution
 from tracking import game_summary, prop_summary, tracked_games, tracked_props
 import ui
@@ -53,7 +54,8 @@ def data_version():
     conn = db()
     try:
         return conn.execute("SELECT MAX(game_date), COUNT(*) FROM player_games").fetchone() + \
-            conn.execute("SELECT COUNT(*) FROM model_params").fetchone()
+            conn.execute("SELECT COUNT(*) FROM model_params").fetchone() + \
+            conn.execute("SELECT MAX(fetched_at) FROM rosters").fetchone()
     finally:
         conn.close()
 
@@ -98,6 +100,18 @@ def team_options():
     return {t['abbreviation']: t['full_name'] for t in sorted(teams.get_teams(), key=lambda t: t['full_name'])}
 
 
+@st.cache_data(ttl=600, show_spinner="Loading the schedule...")
+def slate(game_date):
+    """(games on `game_date`, next game day after it, fetch error or None). Fetches the
+    schedule from stats.nba.com when the stored copy is missing or stale."""
+    conn = db()
+    try:
+        err = nba_schedule.ensure_schedule(conn, game_date)
+        return nba_schedule.games_on(conn, game_date), nba_schedule.next_game_date(conn, game_date), err
+    finally:
+        conn.close()
+
+
 def fmt_odds(o):
     return f"{int(o):+d}"
 
@@ -135,6 +149,7 @@ def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, t
     try:
         ctx = game_context(game_date, version)
         pred = ctx.evaluate(home, away, spread, total, **(lineups or {}))
+        pred['lineups'] = lineups or {}
         evals = evaluate_markets(pred, spread, spread_odds, total, total_odds, ml, min_ev)
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
@@ -162,6 +177,9 @@ def lineup_inputs(away, home, game_date):
         return res
     st.markdown("**Who's playing tonight?** Check the injury report. Untick anyone who's out, "
                 "and tick anyone returning who hasn't played lately. Best players are listed first.")
+    if ctx.roster_date:
+        st.caption(f"Rosters as of {ctx.roster_date} (trades and signings included). Players with no NBA "
+                   "games yet, like rookies, aren't listed: the model has no value for them.")
     for col, team, side in zip(st.columns(2), (away, home), ('away', 'home')):
         r = ctx.roster(team)
         with col.container(border=True):
@@ -254,7 +272,7 @@ def _api_call(fn, *args):
 
 auto_update()
 version = data_version()
-last_game, n_player_games, _ = version
+last_game, n_player_games, *_ = version
 
 with st.sidebar:
     ui.show('<div class="brand">NBA Betting Model<small>Props · spreads · totals · moneylines</small></div>')
@@ -397,6 +415,9 @@ def odds_api_game_panel():
                     g = games[i]
                     run_game(g['home'], g['away'], g['game_date'], g.get('spread'), g.get('spread_odds'),
                              g.get('total'), g.get('total_odds'), g.get('ml'), book=g['book'])
+                    # show it as the selected game, on its date (the date picker isn't drawn yet)
+                    st.session_state['g_sel'] = (g['away'], g['home'], g['game_date'])
+                    st.session_state['gdate'] = date.fromisoformat(g['game_date'])
         if st.session_state.get('odds_api_usage'):
             st.caption(st.session_state['odds_api_usage'])
 
@@ -511,121 +532,217 @@ with tab_prop:
 # Game
 # ---------------------------------------------------------------------------
 
+def pick_game(away, home):
+    """Select a game (from the list or a custom matchup) on the chosen date and show its
+    prediction right away."""
+    st.session_state.update(g_sel=(away, home, st.session_state['gdate'].isoformat()), g_auto=True)
+    st.session_state.pop('game_result', None)
+
+
+def load_custom():
+    away, home = st.session_state.get('c_away'), st.session_state.get('c_home')
+    if not away or not home:
+        st.session_state['c_err'] = "Pick both teams."
+    elif away == home:
+        st.session_state['c_err'] = "Home and away must be different teams."
+    else:
+        pick_game(away, home)
+
+
+def close_game():
+    st.session_state.pop('g_sel', None)
+    st.session_state.pop('game_result', None)
+
+
+def day_label(d):
+    return f"{d:%a %b} {d.day}"
+
+
+def jump_to(d):
+    st.session_state['gdate'] = date.fromisoformat(d)
+
+
+def slate_panel(gdate):
+    """The day's games from the schedule, each with the model's pick; clicking one loads it below."""
+    games, next_day, err = slate(gdate.isoformat())
+    if games.empty:
+        if err:
+            st.warning(f"Couldn't load the schedule from stats.nba.com ({err}). Add a custom matchup below.")
+        msg = f"No games on {day_label(gdate)}."
+        if next_day:
+            c1, c2 = st.columns([3, 1])
+            c1.caption(msg + f" Next game day: {day_label(date.fromisoformat(next_day))}.")
+            c2.button("Go to next game day", on_click=jump_to, args=(next_day,), width="stretch")
+        else:
+            st.caption(msg)
+        return
+    try:
+        ctx = game_context(gdate.isoformat(), version)
+    except Exception:
+        ctx = None
+    st.markdown(f"**{len(games)} game{'s' * (len(games) != 1)} on {day_label(gdate)}**: open one "
+                "to check who's playing and add betting lines")
+    cols = st.columns(3)
+    for i, g in enumerate(games.itertuples()):
+        with cols[i % 3].container(border=True):
+            ui.show(f'<div class="title-row">{ui.team(g.away, 26)}<span class="s">at</span>'
+                    f'{ui.team(g.home, 26)}</div>')
+            st.caption(" · ".join(x for x in (g.status, g.label) if x))
+            try:
+                pred = ctx.evaluate(g.home, g.away)
+                p = pred['p_home_win']
+                fav, pf = (g.home, p) if p >= 0.5 else (g.away, 1 - p)
+                st.markdown(f"Model: **{fav}** {pf:.0%}")
+                why = explain_game(ctx, pred)
+                st.caption(why['summary'])
+                with st.expander(f"Why {fav}?"):
+                    st.markdown("\n".join(f"- {d}" for d in why['details']))
+            except Exception:  # no ratings for a team yet, etc.
+                st.markdown("Model: —")
+            st.button("Open", key=f"slate_{g.game_id}", on_click=pick_game, args=(g.away, g.home),
+                      width="stretch")
+
+
 with tab_game:
     teams = team_options()
     if odds_fetcher.enabled():
         odds_api_game_panel()
-    # Teams and date sit outside the form so the playing/out checklists follow the chosen teams.
-    c1, c2, c3 = st.columns([1.5, 1.5, 1])
-    away = c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
-                        index=None, placeholder="Away")
-    home = c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
-                        index=None, placeholder="Home")
-    gdate = c3.date_input("Game date", value=date.today(), key="gdate")
-    if away and home and away != home:
-        ui.show(f'<div class="title-row">{ui.team(away, 34, teams[away])}<span class="s">at</span>'
-                f'{ui.team(home, 34, teams[home])}</div>')
-    lineups = lineup_inputs(away, home, gdate.isoformat())
+    st.session_state.setdefault('gdate', date.today())   # set here so callbacks can move it
+    gdate = st.date_input("Game date", key="gdate")
+    slate_panel(gdate)
 
-    with st.form("game"):
-        st.caption("Lines are optional. Leave them blank to just get the predicted score.")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Spread** (home team's line)")
-            spread = st.number_input("Home spread", value=None, step=0.5, placeholder="e.g. -5.5")
-            s1, s2 = st.columns(2)
-            spread_home = s1.number_input("Home odds", value=-110, step=5)
-            spread_away = s2.number_input("Away odds", value=-110, step=5)
-        with c2:
-            st.markdown("**Total**")
-            total = st.number_input("Total points", min_value=0.0, value=None, step=0.5, placeholder="e.g. 224.5")
-            t1, t2 = st.columns(2)
-            total_over = t1.number_input("Over odds", value=-110, step=5, key="tover")
-            total_under = t2.number_input("Under odds", value=-110, step=5, key="tunder")
-        with c3:
-            st.markdown("**Moneyline**")
-            m1, m2 = st.columns(2)
-            ml_home = m1.number_input("Home ML", value=None, step=5, placeholder="e.g. -200")
-            ml_away = m2.number_input("Away ML", value=None, step=5, placeholder="e.g. +170")
-        go_game = st.form_submit_button("Evaluate game", type="primary", width="stretch")
+    with st.expander("Add a custom matchup", icon=":material/add:"):
+        c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+        c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                     index=None, placeholder="Away", key="c_away")
+        c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                     index=None, placeholder="Home", key="c_home")
+        c3.button("Load matchup", on_click=load_custom, width="stretch")
+        if st.session_state.get('c_err'):
+            st.error(st.session_state.pop('c_err'))
 
-    if go_game:
-        problems = []
-        if not home or not away:
-            problems.append("Pick both teams.")
-        elif home == away:
-            problems.append("Home and away must be different teams.")
-        if (ml_home is None) != (ml_away is None):
-            problems.append("Enter both moneyline prices (or neither).")
-        prices = [spread_home, spread_away, total_over, total_under] + \
-            [x for x in (ml_home, ml_away) if x is not None]
-        problems += bad_odds(prices)
-        if problems:
-            for m in problems:
-                st.error(m)
-        else:
-            run_game(home, away, gdate.isoformat(),
-                     spread, (int(spread_home), int(spread_away)) if spread is not None else None,
-                     total, (int(total_over), int(total_under)) if total is not None else None,
-                     (int(ml_home), int(ml_away)) if ml_home is not None else None,
-                     lineups=lineups)
+    sel = st.session_state.get('g_sel')
+    if sel and sel[2] != gdate.isoformat():   # picked on another date
+        close_game()
+        sel = None
+    if not sel:
+        st.caption("Open a game above, or add a custom matchup, to check who's playing, add betting "
+                   "lines and see the full breakdown.")
+    else:
+        away, home, _ = sel
 
-    res = st.session_state.get('game_result')
-    if res:
-        pred, evals, stale, calibrated, gd, book = res
-        h, a = pred['home'], pred['away']
-        st.write("")
-        ui.matchup(a, h, team_options(), pred, gd)
-        notes = [f"Projected pace {pred['pace']:.1f} possessions."]
-        adj = adjustment_text(pred)
-        if adj:
-            notes.append(f"Adjustments to the {h} margin: {adj}")
-        if not calibrated:
-            notes.append("Score spreads use default values until the first data update calibrates them.")
-        st.caption(" ".join(notes))
-        if stale:
-            st.warning(stale)
+        st.divider()
+        h1, h2 = st.columns([4, 1], vertical_alignment="center")
+        with h1:
+            ui.show(f'<div class="title-row">{ui.team(away, 34, teams.get(away, away))}<span class="s">at</span>'
+                    f'{ui.team(home, 34, teams.get(home, home))}</div>')
+        h2.button("Close", icon=":material/close:", on_click=close_game, width="stretch")
+        lineups = lineup_inputs(away, home, gdate.isoformat())
+        if st.session_state.pop('g_auto', False):  # just opened: show its prediction
+            run_game(home, away, gdate.isoformat(), lineups=lineups)
 
-        names = {'SPREAD': (h, a), 'TOTAL': ('Over', 'Under'), 'MONEYLINE': (h, a)}
-        for col, e in zip(st.columns(max(len(evals), 1)), evals):
-            sa, sb = names[e['market']]
-            if e['market'] == 'SPREAD':
-                title = "Spread"
-                sa, sb = f"{h} {e['line']:+g}", f"{a} {-e['line']:+g}"
-            elif e['market'] == 'TOTAL':
-                title = f"Total {e['line']:g}"
-                sa, sb = f"Over {e['line']:g}", f"Under {e['line']:g}"
+        with st.form("game"):
+            st.caption("Lines are optional. Leave them blank to just get the predicted score.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("**Spread** (home team's line)")
+                spread = st.number_input("Home spread", value=None, step=0.5, placeholder="e.g. -5.5")
+                s1, s2 = st.columns(2)
+                spread_home = s1.number_input("Home odds", value=-110, step=5)
+                spread_away = s2.number_input("Away odds", value=-110, step=5)
+            with c2:
+                st.markdown("**Total**")
+                total = st.number_input("Total points", min_value=0.0, value=None, step=0.5, placeholder="e.g. 224.5")
+                t1, t2 = st.columns(2)
+                total_over = t1.number_input("Over odds", value=-110, step=5, key="tover")
+                total_under = t2.number_input("Under odds", value=-110, step=5, key="tunder")
+            with c3:
+                st.markdown("**Moneyline**")
+                m1, m2 = st.columns(2)
+                ml_home = m1.number_input("Home ML", value=None, step=5, placeholder="e.g. -200")
+                ml_away = m2.number_input("Away ML", value=None, step=5, placeholder="e.g. +170")
+            go_game = st.form_submit_button("Evaluate game", type="primary", width="stretch")
+
+        if go_game:
+            problems = []
+            if (ml_home is None) != (ml_away is None):
+                problems.append("Enter both moneyline prices (or neither).")
+            prices = [spread_home, spread_away, total_over, total_under] + \
+                [x for x in (ml_home, ml_away) if x is not None]
+            problems += bad_odds(prices)
+            if problems:
+                for m in problems:
+                    st.error(m)
             else:
-                title = "Moneyline"
-                sa, sb = f"{h} to win", f"{a} to win"
-            with col.container(border=True):
-                st.markdown(f"**{title}**")
-                if e['pick'] == 'PASS':
-                    lean = sa if e['p_a'] >= e['p_b'] else sb
-                    ui.verdict(False, "No bet", meta=f"Neither side clears <b>+{min_ev:.1%}</b> EV. "
-                                                    f"Model leans {ui.esc(lean)}.")
+                run_game(home, away, gdate.isoformat(),
+                         spread, (int(spread_home), int(spread_away)) if spread is not None else None,
+                         total, (int(total_over), int(total_under)) if total is not None else None,
+                         (int(ml_home), int(ml_away)) if ml_home is not None else None,
+                         lineups=lineups)
+
+        res = st.session_state.get('game_result')
+        if res:
+            pred, evals, stale, calibrated, gd, book = res
+            h, a = pred['home'], pred['away']
+            st.write("")
+            ui.matchup(a, h, team_options(), pred, gd)
+            notes = [f"Projected pace {pred['pace']:.1f} possessions."]
+            adj = adjustment_text(pred)
+            if adj:
+                notes.append(f"Adjustments to the {h} margin: {adj}")
+            if not calibrated:
+                notes.append("Score spreads use default values until the first data update calibrates them.")
+            st.caption(" ".join(notes))
+            try:
+                why = explain_game(game_context(gd, version), pred, **pred.get('lineups', {}))
+                with st.container(border=True):
+                    st.markdown(f"**Why:** {why['summary']}")
+                    st.markdown("\n".join(f"- {d}" for d in why['details']))
+            except Exception:  # the explanation is a nice-to-have; the numbers above still stand
+                pass
+            if stale:
+                st.warning(stale)
+
+            names = {'SPREAD': (h, a), 'TOTAL': ('Over', 'Under'), 'MONEYLINE': (h, a)}
+            for col, e in zip(st.columns(max(len(evals), 1)), evals):
+                sa, sb = names[e['market']]
+                if e['market'] == 'SPREAD':
+                    title = "Spread"
+                    sa, sb = f"{h} {e['line']:+g}", f"{a} {-e['line']:+g}"
+                elif e['market'] == 'TOTAL':
+                    title = f"Total {e['line']:g}"
+                    sa, sb = f"Over {e['line']:g}", f"Under {e['line']:g}"
                 else:
-                    side, odds, ev, p = ((sa, e['odds_a'], e['ev_a'], e['p_a']) if e['pick'] == 'A'
-                                         else (sb, e['odds_b'], e['ev_b'], e['p_b']))
-                    ui.verdict(True, side, fmt_odds(odds), f"EV <b>{ev:+.1%}</b> · model <b>{p:.0%}</b> · stake "
-                                                         f"<b>{e['kelly'] / 4:.1%}</b> (quarter Kelly)",
-                               abbr=None if e['market'] == 'TOTAL' else (h if e['pick'] == 'A' else a))
-                if e['warning']:
-                    st.warning(e['warning'])
-                ui.odds_table([(sa, fmt_odds(e['odds_a']), pct(e['p_a']), pct(e['fair_a']), e['ev_a']),
-                               (sb, fmt_odds(e['odds_b']), pct(e['p_b']), pct(1 - e['fair_a']), e['ev_b'])],
-                              {'A': 0, 'B': 1}.get(e['pick']))
-                lean = e['pick'] if e['pick'] != 'PASS' else ('A' if e['p_a'] >= e['p_b'] else 'B')
-                label = (f"{sa if lean == 'A' else sb} ({fmt_odds(e['odds_a'] if lean == 'A' else e['odds_b'])})"
-                         + (" (lean, no edge)" if e['pick'] == 'PASS' else ""))
-                conn = db()
-                try:
-                    track_button(game_log_id(conn, gd, pred, e, book, tracked_only=True), label,
-                                 f"track_{e['market']}",
-                                 lambda e=e: log_game_evals(conn, gd, pred, [e], book, tracked=True),
-                                 lambda i: untrack_game_bet(conn, i))
-                finally:
-                    conn.close()
+                    title = "Moneyline"
+                    sa, sb = f"{h} to win", f"{a} to win"
+                with col.container(border=True):
+                    st.markdown(f"**{title}**")
+                    if e['pick'] == 'PASS':
+                        lean = sa if e['p_a'] >= e['p_b'] else sb
+                        ui.verdict(False, "No bet", meta=f"Neither side clears <b>+{min_ev:.1%}</b> EV. "
+                                                        f"Model leans {ui.esc(lean)}.")
+                    else:
+                        side, odds, ev, p = ((sa, e['odds_a'], e['ev_a'], e['p_a']) if e['pick'] == 'A'
+                                             else (sb, e['odds_b'], e['ev_b'], e['p_b']))
+                        ui.verdict(True, side, fmt_odds(odds), f"EV <b>{ev:+.1%}</b> · model <b>{p:.0%}</b> · stake "
+                                                             f"<b>{e['kelly'] / 4:.1%}</b> (quarter Kelly)",
+                                   abbr=None if e['market'] == 'TOTAL' else (h if e['pick'] == 'A' else a))
+                    if e['warning']:
+                        st.warning(e['warning'])
+                    ui.odds_table([(sa, fmt_odds(e['odds_a']), pct(e['p_a']), pct(e['fair_a']), e['ev_a']),
+                                   (sb, fmt_odds(e['odds_b']), pct(e['p_b']), pct(1 - e['fair_a']), e['ev_b'])],
+                                  {'A': 0, 'B': 1}.get(e['pick']))
+                    lean = e['pick'] if e['pick'] != 'PASS' else ('A' if e['p_a'] >= e['p_b'] else 'B')
+                    label = (f"{sa if lean == 'A' else sb} ({fmt_odds(e['odds_a'] if lean == 'A' else e['odds_b'])})"
+                             + (" (lean, no edge)" if e['pick'] == 'PASS' else ""))
+                    conn = db()
+                    try:
+                        track_button(game_log_id(conn, gd, pred, e, book, tracked_only=True), label,
+                                     f"track_{e['market']}",
+                                     lambda e=e: log_game_evals(conn, gd, pred, [e], book, tracked=True),
+                                     lambda i: untrack_game_bet(conn, i))
+                    finally:
+                        conn.close()
 
 
 # ---------------------------------------------------------------------------

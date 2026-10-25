@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from game_model import (COEF_BOUNDS, GameContext, GameParams, backtest_games, build_ratings, calibrate,
+from game_model import (COEF_BOUNDS, GameContext, GameParams, backtest_games, build_ratings, calibrate, explain_game,
+                        explain_pick,
                         evaluate_markets, fit_coefs, game_rows, margin_pmf, market_probs, player_values,
                         predict_game, probs_vs_line, resolve_out, rest_flags, stored_coefs)
 from fetch_game_logs import ingest_frames
@@ -164,3 +165,78 @@ def test_returning_player_can_be_marked_in(league_conn):
     # marking him both in and out means out
     assert ctx.evaluate('BOS', 'LAL', home_in=[star], home_out=[star])['margin'] == \
         pytest.approx(without['margin'])
+
+
+def _store_rosters(conn, rosters, fetched_at, season=2025):
+    conn.executemany("INSERT INTO rosters (season, team, player_id, player_name, fetched_at) VALUES (?, ?, ?, ?, ?)",
+                     [(season, team, pid, f"P{pid}", fetched_at) for team, pids in rosters.items() for pid in pids])
+    conn.commit()
+
+
+def test_current_rosters_move_traded_player(league_conn):
+    ids = {t: [r[0] for r in league_conn.execute(
+        "SELECT DISTINCT player_id FROM player_games WHERE team=? ORDER BY player_id", (t,))]
+        for t in ('BOS', 'LAL', 'GSW', 'DEN', 'MIA', 'NYK')}
+    star = league_conn.execute("SELECT player_id FROM player_games WHERE team='BOS' "
+                               "ORDER BY minutes DESC").fetchone()[0]
+    before = GameContext(league_conn, '2026-02-01').evaluate('LAL', 'BOS')
+    rosters = {t: [p for p in v if p != star] for t, v in ids.items()}
+    rosters['LAL'].append(star)
+    rosters['LAL'].append(999)                     # a rookie with no games: left out
+    _store_rosters(league_conn, rosters, '2026-01-15T12:00:00+00:00')
+
+    ctx = GameContext(league_conn, '2026-02-01')
+    assert ctx.roster_date == '2026-01-15'
+    lal = ctx.roster('LAL')
+    assert star in set(lal['player_id']) and 999 not in set(lal['player_id'])
+    assert lal.loc[lal['player_id'] == star, 'recent'].iloc[0]     # was in BOS's rotation
+    assert star not in set(ctx.roster('BOS')['player_id'])
+    after = ctx.evaluate('LAL', 'BOS')
+    assert after['margin'] > before['margin'] + 1
+
+    # a game before the rosters were fetched uses the game logs, not players who joined later
+    past = GameContext(league_conn, '2026-01-10')
+    assert past.roster_date is None and star in set(past.roster('BOS')['player_id'])
+
+
+def test_refresh_rosters(conn, monkeypatch):
+    import nba_rosters
+    monkeypatch.setattr(nba_rosters, 'nba_teams', lambda: {'BOS': 1, 'LAL': 2})
+    raw = {1: pd.DataFrame({'PLAYER_ID': [10, 11], 'PLAYER': ['A', 'B'], 'POSITION': ['G', None],
+                            'HOW_ACQUIRED': ['Signed', None]}),
+           2: pd.DataFrame({'PLAYER_ID': [20], 'PLAYER': ['C'], 'POSITION': ['C'], 'HOW_ACQUIRED': ['Traded']})}
+    monkeypatch.setattr(nba_rosters, 'fetch_roster', lambda team_id, season: raw[team_id])
+    assert nba_rosters.refresh_rosters(conn, 2026, pause=0, log=lambda *_: None) == 3
+    df, fetched = nba_rosters.stored_rosters(conn, 2026)
+    assert fetched and dict(zip(df['player_id'], df['team'])) == {10: 'BOS', 11: 'BOS', 20: 'LAL'}
+
+    # one team failing keeps the old rosters
+    def fail(team_id, season):
+        if team_id == 2:
+            raise RuntimeError('blocked')
+        return raw[team_id].iloc[:1]
+    monkeypatch.setattr(nba_rosters, 'fetch_roster', fail)
+    with pytest.raises(RuntimeError):
+        nba_rosters.refresh_rosters(conn, 2026, pause=0, log=lambda *_: None)
+    assert len(nba_rosters.stored_rosters(conn, 2026)[0]) == 3
+
+
+def test_explain_pick_adds_up(league_conn):
+    ctx = GameContext(league_conn, '2026-02-01')
+    star = int(ctx.roster('BOS')['player_id'].iloc[0])
+    for kw in ({}, {'home_out': [star]}):
+        pred = ctx.evaluate('BOS', 'LAL', **kw)
+        pred['b2b_away'], pred['adjustments']['b2b'] = 1, 1.5      # pretend LAL played yesterday
+        pred['margin'] += 1.5
+        fav, margin, parts = explain_pick(pred, ctx.ratings)
+        assert fav == ('BOS' if pred['margin'] >= 0 else 'LAL') and margin == pytest.approx(abs(pred['margin']))
+        pts = [p for _, p in parts]
+        assert sum(pts) == pytest.approx(margin, abs=0.3 * 4)       # parts under 0.3 pts are dropped
+        assert pts == sorted(pts, key=lambda p: -abs(p))
+        assert dict(parts)['rest'] == pytest.approx(1.5 if fav == 'BOS' else -1.5)
+
+        why = explain_game(ctx, pred, **kw)
+        assert why['summary'].endswith('.') and fav in why['summary']
+        assert 'LAL played yesterday' in why['summary'] and len(why['details']) == 6
+        if kw:
+            assert 'out for BOS' in why['summary'] and 'BOS without' in why['details'][1]

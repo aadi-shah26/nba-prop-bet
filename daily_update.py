@@ -5,6 +5,7 @@ Daily maintenance (run once a day after the previous night's games, or press
   1. refresh the current season's player and team game logs (first run: last 3 seasons)
   2. settle logged props and game bets against actual results
   3. re-calibrate the game model's margin adjustments and margin/total SDs
+  4. refresh the season schedule (upcoming games, so the app can list them) and team rosters
 
     python daily_update.py
 """
@@ -15,6 +16,8 @@ from bet_signals import settle_props
 from db import connect, init_db, season_for_date, season_str, set_meta
 from fetch_game_logs import ingest_season
 from game_model import calibrate, settle_games
+from nba_rosters import refresh_rosters
+from nba_schedule import refresh_schedule
 
 
 def update(conn, log=print, retries=4):
@@ -42,6 +45,14 @@ def update(conn, log=print, retries=4):
         c = cal[3]
         log(f"📐 Game model SDs: margin {cal[0]:.2f}, total {cal[1]:.2f} (from {cal[2]} games); "
             f"margin scale {c['scale']:.2f}, back-to-back {c['b2b']:.1f} pts, lineup {c['lineup']:.3f}")
+    try:
+        refresh_schedule(conn, season, log=log)
+    except Exception as e:  # not worth failing the update over; the app retries on its own
+        log(f"⚠️ Couldn't refresh the schedule: {type(e).__name__}: {e}")
+    try:
+        refresh_rosters(conn, season, log=log)
+    except Exception as e:  # the stored rosters (or the game logs) are used instead
+        log(f"⚠️ Couldn't refresh rosters: {type(e).__name__}: {e}")
     last = conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
     set_meta(conn, 'last_update', datetime.now(timezone.utc).isoformat(timespec='seconds'))
     log(f"📊 Latest game in database: {last}")
