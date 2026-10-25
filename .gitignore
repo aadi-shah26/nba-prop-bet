@@ -55,3 +55,5 @@ logs/
 # Bet outputs (optional - remove if you want to track)
 daily_bets/
 .logo_cache/
+*.db-wal
+*.db-shm

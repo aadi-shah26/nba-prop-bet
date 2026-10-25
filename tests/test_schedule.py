@@ -64,6 +64,8 @@ def test_ensure_schedule_refetches_only_when_stale(tmp_path, monkeypatch):
     assert calls == [2026]                                     # fresh: no refetch
     old = (datetime.now(timezone.utc) - timedelta(hours=nba_schedule.STALE_HOURS + 1)).isoformat()
     conn.execute("UPDATE schedule SET fetched_at=?", (old,))
+    nba_schedule.ensure_schedule(conn, '2026-10-21', refresh_stale=False)
+    assert calls == [2026]                                     # stale, but left to the background update
     nba_schedule.ensure_schedule(conn, '2026-10-21')
     assert calls == [2026, 2026]
 
@@ -76,3 +78,7 @@ def test_ensure_schedule_reports_fetch_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(nba_schedule, 'fetch_schedule', fail)
     assert 'TimeoutError' in nba_schedule.ensure_schedule(conn, '2026-10-20')
     assert nba_schedule.games_on(conn, '2026-10-20').empty
+    calls = []
+    monkeypatch.setattr(nba_schedule, 'fetch_schedule', lambda season, timeout=30: calls.append(season))
+    assert 'TimeoutError' in nba_schedule.ensure_schedule(conn, '2026-10-20')   # backing off: no new fetch
+    assert calls == []

@@ -1,4 +1,5 @@
 """Drives the Streamlit app headlessly against a synthetic league database."""
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -354,24 +355,41 @@ def test_track_this_and_tracked_tab(app_db):
     assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (0,)
 
 
-def test_auto_update_on_open(app_db, monkeypatch):
+def test_auto_update_runs_in_background(app_db, monkeypatch):
+    import background
     import daily_update
-    calls = []
+    calls, gate = [], threading.Event()
 
-    def fake_update(conn, log=print, retries=4):
-        calls.append(retries)
+    def fake_update(conn, log=print, retries=4, quick=False):
+        gate.wait(10)                                               # still running during the first render
+        calls.append((retries, quick))
     monkeypatch.setenv('NBA_AUTO_UPDATE', '1')
     monkeypatch.setattr(daily_update, 'update', fake_update)
+    monkeypatch.setattr(daily_update, 'update_due', lambda conn: "test")
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
-    assert not at.exception and calls == [2]
-    at.run()                                                        # reruns in the same session: no
+    assert not at.exception and calls == []                         # the page didn't wait for it
+    assert any('in the background' in c.value for c in at.caption)
+    gate.set()
+    background.wait(10)
+    assert calls == [(2, True)]
+    at.run()
+    assert not any('in the background' in c.value for c in at.caption)
     st_testing.AppTest.from_file(APP, default_timeout=120).run()    # new session within 30 min: no
-    assert calls == [2]
-    db.set_meta(app_db, 'last_update_attempt', '2000-01-01T00:00:00+00:00')
+    background.wait(10)
+    assert calls == [(2, True)]
 
-    def offline(conn, log=print, retries=4):
+    db.set_meta(app_db, 'last_update_attempt', '2000-01-01T00:00:00+00:00')
+    monkeypatch.setattr(daily_update, 'update_due', lambda conn: None)   # nothing new: no update
+    st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    background.wait(10)
+    assert calls == [(2, True)]
+
+    def offline(conn, log=print, retries=4, quick=False):
         raise ConnectionError("offline")
+    monkeypatch.setattr(daily_update, 'update_due', lambda conn: "test")
     monkeypatch.setattr(daily_update, 'update', offline)
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    background.wait(10)
+    assert background.status()['error'] == "ConnectionError: offline"
+    at.run()
     assert not at.exception                                         # falls back to saved data
-    assert any('offline' in e.value for e in at.error)

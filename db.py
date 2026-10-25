@@ -22,7 +22,10 @@ SEASON_TYPES = ('Regular Season', 'PlayIn', 'Playoffs')
 
 
 def connect(db_path=None):
-    conn = sqlite3.connect(str(db_path or DB_PATH))
+    # WAL lets the app read while the background update writes; timeout waits out a brief lock
+    # instead of failing with "database is locked".
+    conn = sqlite3.connect(str(db_path or DB_PATH), timeout=30)
+    conn.execute('PRAGMA journal_mode = WAL')
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
