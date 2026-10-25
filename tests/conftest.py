@@ -65,6 +65,13 @@ def make_league(seasons=(2024, 2025), games_per_pair=4, seed=0, team_strength=No
     return out
 
 
+@pytest.fixture(autouse=True)
+def no_auto_update(monkeypatch):
+    """The app pulls stats.nba.com and team logos when opened; tests must stay offline."""
+    monkeypatch.setenv('NBA_AUTO_UPDATE', '0')
+    monkeypatch.setenv('NBA_LOGOS', '0')
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = connect(tmp_path / 'test.db')

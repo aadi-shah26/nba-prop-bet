@@ -159,13 +159,13 @@ def ingest_frames(conn, season, season_type, player_raw, team_raw, log=print):
     return upsert(conn, 'player_games', p, PLAYER_COLS), upsert(conn, 'team_games', t, TEAM_COLS)
 
 
-def ingest_season(conn, season, season_types=SEASON_TYPES, pause=1.0, log=print):
+def ingest_season(conn, season, season_types=SEASON_TYPES, pause=1.0, log=print, retries=4):
     total_p = total_t = 0
     for st in season_types:
         try:
-            p_raw = fetch_league_log(season, st, 'P', log=log)
+            p_raw = fetch_league_log(season, st, 'P', retries=retries, log=log)
             time.sleep(pause)
-            t_raw = fetch_league_log(season, st, 'T', log=log)
+            t_raw = fetch_league_log(season, st, 'T', retries=retries, log=log)
             time.sleep(pause)
         except RuntimeError as e:
             if st == 'PlayIn':  # a handful of games; not worth failing the whole run over

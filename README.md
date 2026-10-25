@@ -1,10 +1,10 @@
-# 🏀 NBA Prop & Game Model
+# NBA Prop & Game Model
 
 A local web app: pick a player or a game, type in the line and prices from your sportsbook,
 and it tells you **OVER / UNDER / PASS** (or which side of a spread/total/moneyline) with the
 expected value behind it. Projections come from every NBA player and team box score of the
-last 3 seasons. Everything you evaluate is logged and settled automatically, so you can see
-whether the model actually beats the market.
+last 3 seasons. Press **Track this** on any pick and it settles itself after the game, so you
+can see whether the model was right and whether it actually beats the market.
 
 
 ## Start it
@@ -18,13 +18,16 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-First time: press **🔄 Update data** in the sidebar. It downloads 3 seasons from stats.nba.com
-(about a minute). After that, press it once a day — it adds last night's games, settles your
-logged bets, and recalibrates the game model.
+Opening the app pulls the latest games from stats.nba.com by itself (the first time it
+downloads 3 seasons, about a minute). It adds last night's games, settles your tracked bets and
+recalibrates the game model, so the data is current to today without pressing anything. It
+runs at most every 30 minutes; **Update data** in the sidebar does it on demand. If
+stats.nba.com can't be reached, the app says so and uses the saved data. To turn the automatic
+pull off, set `NBA_AUTO_UPDATE=0`.
 
 ## Using it
 
-**🎯 Player prop** — choose the player (type to search), the stat, the line, both prices
+**Player props** — choose the player (type to search), the stat, the line, both prices
 (default -110 / -110), optionally the opponent and the game date. You get:
 
 * the verdict: **BET OVER/UNDER** with EV and a ¼-Kelly stake size, or **PASS**
@@ -40,17 +43,30 @@ starter out who will push this player's minutes up.
 Stats: points, rebounds, assists, 3-pointers made, PRA, PR, PA, RA, steals, blocks,
 steals+blocks, turnovers.
 
-**🏀 Game** — choose away and home team. Leave the lines blank to just get the predicted
-score and win probability, or fill in any of spread (the **home** team's line), total and
-moneyline to get a pick for each. Once both teams are picked, a **who's playing tonight** checklist
+**Games** — choose away and home team (their logos appear once both are picked). Leave the
+lines blank to just get the predicted score and win probability, or fill in any of spread (the
+**home** team's line), total and moneyline to get a pick for each. Once both teams are picked, a **who's playing tonight** checklist
 appears for each team (best players first; check the injury report). Everyone from the team's
 last 10 games starts ticked, so untick anyone who's out. Players who haven't played lately
 (injured, out of the rotation) start unticked, so tick anyone returning. The result shows the
 lineup and back-to-back adjustments it applied.
 
-**📒 My results** — record, profit, ROI and the model-vs-market Brier score on everything
-you've logged, plus the full log. **This is the real test of edge.** Without free historical
-lines nobody can backtest profit, so give it a few hundred logged props before trusting it.
+**Track this** — under every prop and game-line result. Tracking a PASS follows the side the
+model leaned to. Press **Untrack** to undo.
+
+**Tracked bets** — everything you tracked, newest first, filterable by *Pending* / *Finished*.
+Each row shows the bet, the model's chance and EV, the actual stat or final score, and
+a coloured Hit / Miss / Push / Void (DNP) tag with the profit in units. *Awaiting result* means
+the game is over but its box score isn't in yet; **Check for results** pulls it. Above each
+table: how often the model's side hit, plus record, profit and ROI on the actual bets (a tracked
+PASS counts toward the hit rate but not the profit). The expander at the bottom lets you enter a
+result by hand, stop tracking, or delete.
+
+The sidebar switch **Record every evaluation for calibration** (on by default) also quietly
+saves what you *don't* track. The model-vs-market Brier score uses all of it, because grading
+only the bets you chose to track would flatter or punish the model unfairly. **That comparison
+is the real test of edge.** Without free historical lines nobody can backtest profit, so give
+it a few hundred props before trusting it.
 
 ### Optional: live lines from The Odds API
 
@@ -62,8 +78,10 @@ Typing lines in always works. If you'd rather pull them from the books, get a ke
 ODDS_API_KEY=your_key_here
 ```
 
-Each tab then shows a **📡 Import … from The Odds API** panel: pick a date and a book
-(DraftKings, FanDuel, BetMGM, Caesars, …), load the games, and evaluate any line in one click.
+Each tab then shows a **Import … from The Odds API** panel: pick a date and a book
+(DraftKings, FanDuel, BetMGM, Caesars, …). The prop panel loads the chosen date's games by
+itself (today by default, and it's free); game lines load when you press the button because
+they cost credits. Then evaluate any line in one click.
 Imported evaluations go through exactly the same model and are logged with the book's name.
 Credits: listing games is free, a whole slate of spreads/totals/moneylines is 3 credits, and
 props cost 1 credit per market per game. The panel shows your remaining credits after each call.

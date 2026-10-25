@@ -94,16 +94,38 @@ def print_eval(r):
 # Logging / settling / report
 # ---------------------------------------------------------------------------
 
-def log_prop(conn, r, book=None):
-    conn.execute("""INSERT OR IGNORE INTO prop_log (logged_at, game_date, player_id, player_name, stat,
+def log_prop(conn, r, book=None, tracked=False):
+    """Save an evaluation. tracked=True marks it as a bet you're following ("Track this");
+    re-logging the same prop never un-tracks it. Returns the row id."""
+    key = (r['game_date'], r['player_id'], r['stat'], r['line'], int(r['over_odds']), int(r['under_odds']),
+           book or '')
+    conn.execute("""INSERT INTO prop_log (logged_at, game_date, player_id, player_name, stat,
                     line, over_odds, under_odds, book, opponent, proj_mean, proj_sd, p_over, p_under,
-                    p_push, fair_over, ev_over, ev_under, pick)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                 (datetime.now(timezone.utc).isoformat(timespec='seconds'), r['game_date'],
-                  r['player_id'], r['player_name'], r['stat'], r['line'], int(r['over_odds']),
-                  int(r['under_odds']), book or '', r['opponent'], r['mean'], r['sd'], r['p_over'],
-                  r['p_under'], r['p_push'], r['fair_over'], r['ev_over'], r['ev_under'], r['pick']))
+                    p_push, fair_over, ev_over, ev_under, pick, tracked)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT (game_date, player_id, stat, line, over_odds, under_odds, book)
+                    DO UPDATE SET tracked = MAX(tracked, excluded.tracked)""",
+                 (datetime.now(timezone.utc).isoformat(timespec='seconds'), *key[:2], r['player_name'],
+                  *key[2:], r['opponent'], r['mean'], r['sd'], r['p_over'], r['p_under'], r['p_push'],
+                  r['fair_over'], r['ev_over'], r['ev_under'], r['pick'], int(tracked)))
     conn.commit()
+    return prop_log_id(conn, r, book)
+
+
+def prop_log_id(conn, r, book=None, tracked_only=False):
+    """Row id of this evaluation in prop_log (None if it isn't there / isn't tracked)."""
+    row = conn.execute("SELECT id FROM prop_log WHERE game_date=? AND player_id=? AND stat=? AND line=? "
+                       "AND over_odds=? AND under_odds=? AND book=?" + (" AND tracked=1" if tracked_only else ""),
+                       (r['game_date'], r['player_id'], r['stat'], r['line'], int(r['over_odds']),
+                        int(r['under_odds']), book or '')).fetchone()
+    return row[0] if row else None
+
+
+def untrack_prop(conn, prop_id):
+    """Stop following a prop. The evaluation stays as calibration data."""
+    n = conn.execute("UPDATE prop_log SET tracked = 0 WHERE id = ?", (prop_id,)).rowcount
+    conn.commit()
+    return n > 0
 
 
 def prop_result(actual, line, pick):
@@ -174,7 +196,10 @@ def report(conn):
     from tracking import game_summary, prop_summary
     print(f"\n{'=' * 70}\n📒 PERFORMANCE REPORT\n{'=' * 70}")
     for label, summ in (('Props', prop_summary(conn)), ('Game lines', game_summary(conn))):
-        print(f"\n{label}: logged {summ['logged']}, settled {summ['settled']}")
+        acc = summ['accuracy']
+        print(f"\n{label}: tracked {summ['tracked']} ({summ['pending']} pending) of {summ['logged']} evaluated"
+              + (f"; model's side hit {acc['hits']}/{acc['hits'] + acc['misses']} ({acc['rate']:.0%})"
+                 if acc['rate'] is not None else ''))
         r = summ['record']
         if r:
             print(f"  Picks: {r['picks']}   {r['wins']}-{r['losses']}-{r['pushes']}   profit {r['profit']:+.2f}u"
@@ -249,7 +274,7 @@ def interactive(conn, game_date=None, book=None, log=True):
             continue
         print_eval(r)
         if log:
-            log_prop(conn, r, book)
+            log_prop(conn, r, book, tracked=r['pick'] != 'PASS')
 
 
 def main():
@@ -290,7 +315,7 @@ def main():
         raise SystemExit("Not enough recent games to project this player.")
     print_eval(r)
     if not a.no_log:
-        log_prop(conn, r, a.book)
+        log_prop(conn, r, a.book, tracked=r['pick'] != 'PASS')
 
 
 if __name__ == '__main__':

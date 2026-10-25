@@ -1,14 +1,22 @@
 """
-Performance of everything you've logged (props and game lines).
+Performance of what you track (props and game lines), plus the model's calibration.
 
-Profit is in units (1u staked per pick). Calibration compares the model's probability with
-the market's no-vig probability on every settled prop: if the market's Brier score is lower,
-the market is the better forecaster and the model has no proven edge yet.
+"Track this" marks an evaluation as a bet you're following. Tracked rows give the record:
+whether the model's side hit, and the profit in units (1u staked per pick) on the ones that
+were actual bets. Calibration uses every saved evaluation, tracked or not, because picking
+which ones to track would bias it: it compares the model's probability with the market's
+no-vig probability, and if the market's Brier score is lower, the model has no proven edge yet.
 """
 
+from datetime import date
+
+import numpy as np
 import pandas as pd
 
 from odds import american_to_decimal
+
+PENDING, HIT, MISS, PUSH, VOID = 'Pending', 'Hit', 'Miss', 'Push', 'Void (DNP)'
+AWAITING = 'Awaiting result'
 
 
 def _record(df, odds_col, ev_col):
@@ -26,16 +34,55 @@ def _record(df, odds_col, ev_col):
     }
 
 
+def _accuracy(status):
+    """Hits / (hits + misses) of the model's side over finished tracked rows."""
+    hits, misses = int((status == HIT).sum()), int((status == MISS).sum())
+    return {'hits': hits, 'misses': misses, 'rate': hits / (hits + misses) if hits + misses else None}
+
+
+def _status(outcome, settled, void):
+    """outcome: +1 the model's side won, -1 it lost, 0 push (NaN when unsettled)."""
+    return np.select([void, ~settled, outcome > 0, outcome < 0], [VOID, PENDING, HIT, MISS], PUSH)
+
+
+def _profit(is_bet, outcome, odds):
+    dec = odds.map(american_to_decimal)
+    return pd.Series(np.where(~is_bet | outcome.isna(), np.nan,
+                              np.where(outcome > 0, dec - 1, np.where(outcome < 0, -1.0, 0.0))),
+                     index=outcome.index)
+
+
+# ---------------------------------------------------------------------------
+# Props
+# ---------------------------------------------------------------------------
+
+def _prop_rows(conn, where="tracked = 1"):
+    df = pd.read_sql_query(f"SELECT * FROM prop_log WHERE {where}", conn)
+    df['actual'] = pd.to_numeric(df['actual'])      # all-NULL columns come back as objects
+    is_bet = df['pick'].isin(['OVER', 'UNDER'])
+    # a tracked PASS is judged on the model's lean: whichever side it rated more likely
+    df['side'] = df['pick'].where(is_bet, np.where(df['p_over'] >= df['p_under'], 'OVER', 'UNDER'))
+    over = df['side'] == 'OVER'
+    df['is_bet'] = is_bet
+    df['odds'] = df['over_odds'].where(over, df['under_odds'])
+    df['ev'] = df['ev_over'].where(over, df['ev_under'])
+    df['p_side'] = df['p_over'].where(over, df['p_under'])
+    df['outcome'] = np.sign(df['actual'] - df['line']) * np.where(over, 1, -1)
+    df['status'] = _status(df['outcome'], df['result'].notna(), df['result'] == 'DNP')
+    df['profit'] = _profit(is_bet, df['outcome'], df['odds'])
+    return df
+
+
 def prop_summary(conn):
-    df = pd.read_sql_query("SELECT * FROM prop_log WHERE result IS NOT NULL", conn)
+    t = _prop_rows(conn)
     out = {'logged': conn.execute("SELECT COUNT(*) FROM prop_log").fetchone()[0],
-           'settled': len(df), 'record': None, 'calibration': None}
-    bets = df[df['pick'].isin(['OVER', 'UNDER']) & df['result'].isin(['WIN', 'LOSS', 'PUSH'])].copy()
+           'tracked': len(t), 'pending': int((t['status'] == PENDING).sum()),
+           'settled': int((t['status'] != PENDING).sum()), 'accuracy': _accuracy(t['status']),
+           'record': None, 'calibration': None}
+    bets = t[t['is_bet'] & t['result'].isin(['WIN', 'LOSS', 'PUSH'])]
     if len(bets):
-        over = bets['pick'] == 'OVER'
-        bets['odds'] = bets['over_odds'].where(over, bets['under_odds'])
-        bets['ev'] = bets['ev_over'].where(over, bets['ev_under'])
         out['record'] = _record(bets, 'odds', 'ev')
+    df = pd.read_sql_query("SELECT * FROM prop_log WHERE result IS NOT NULL", conn)
     c = df[df['actual'].notna() & (df['actual'] != df['line'])].copy()
     if len(c):
         c['p'] = c['p_over'] / (c['p_over'] + c['p_under'])
@@ -52,35 +99,108 @@ def prop_summary(conn):
     return out
 
 
+def tracked_props(conn, show='All', today=None):
+    """Display table of tracked props, newest game first. show: 'All' | 'Pending' | 'Finished'."""
+    df = _filter(_prop_rows(conn), show).sort_values(['game_date', 'id'], ascending=False)
+    return pd.DataFrame([{
+        'id': r.id,
+        'Date': r.game_date,
+        'Player': r.player_name,
+        'Bet': f"{r.stat} {r.side.title()} {r.line:g} ({int(r.odds):+d})",
+        'Type': 'Bet' if r.is_bet else 'Lean',
+        'vs': r.opponent or '',
+        'Projection': round(r.proj_mean, 1),
+        'Model %': r.p_side,
+        'EV': r.ev,
+        'Actual': r.actual,
+        'Result': _result_text(r, today),
+        'Profit (u)': r.profit,
+    } for r in df.itertuples()], columns=TABLE_COLUMNS['props'])
+
+
+# ---------------------------------------------------------------------------
+# Game lines
+# ---------------------------------------------------------------------------
+
+def _game_rows(conn, where="tracked = 1"):
+    df = pd.read_sql_query(f"SELECT * FROM game_log WHERE {where}", conn)
+    df[['line', 'home_pts', 'away_pts']] = df[['line', 'home_pts', 'away_pts']].apply(pd.to_numeric)
+    is_bet = df['pick'].isin(['A', 'B'])
+    df['side'] = df['pick'].where(is_bet, np.where(df['p_a'] >= df['p_b'], 'A', 'B'))
+    a = df['side'] == 'A'
+    df['is_bet'] = is_bet
+    df['odds'] = df['odds_a'].where(a, df['odds_b'])
+    df['ev'] = df['ev_a'].where(a, df['ev_b'])
+    df['p_side'] = df['p_a'].where(a, df['p_b'])
+    margin = df['home_pts'] - df['away_pts']
+    v = np.select([df['market'] == 'SPREAD', df['market'] == 'TOTAL'],
+                  [margin + df['line'], df['home_pts'] + df['away_pts'] - df['line']], margin)
+    df['outcome'] = pd.Series(np.sign(v), index=df.index) * np.where(a, 1, -1)
+    df['status'] = _status(df['outcome'], df['result'].notna(), pd.Series(False, index=df.index))
+    df['profit'] = _profit(is_bet, df['outcome'], df['odds'])
+    return df
+
+
 def game_summary(conn):
-    df = pd.read_sql_query("SELECT * FROM game_log WHERE result IS NOT NULL", conn)
+    t = _game_rows(conn)
     out = {'logged': conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0],
-           'settled': len(df), 'record': None}
-    bets = df[df['pick'].isin(['A', 'B']) & df['result'].isin(['WIN', 'LOSS', 'PUSH'])].copy()
+           'tracked': len(t), 'pending': int((t['status'] == PENDING).sum()),
+           'settled': int((t['status'] != PENDING).sum()), 'accuracy': _accuracy(t['status']),
+           'record': None}
+    bets = t[t['is_bet'] & t['result'].isin(['WIN', 'LOSS', 'PUSH'])]
     if len(bets):
-        a = bets['pick'] == 'A'
-        bets['odds'] = bets['odds_a'].where(a, bets['odds_b'])
-        bets['ev'] = bets['ev_a'].where(a, bets['ev_b'])
         out['record'] = _record(bets, 'odds', 'ev')
     return out
 
 
-def recent_props(conn, limit=200):
-    return pd.read_sql_query(
-        """SELECT game_date, player_name, stat, line, over_odds, under_odds, opponent,
-                  ROUND(proj_mean, 1) AS projection, ROUND(p_over, 3) AS p_over,
-                  ROUND(p_under, 3) AS p_under, ROUND(MAX(ev_over, ev_under), 3) AS best_ev,
-                  pick, actual, result
-           FROM prop_log ORDER BY game_date DESC, id DESC LIMIT ?""", conn, params=(limit,))
+def _game_side_label(r):
+    if r.market == 'TOTAL':
+        return f"{'Over' if r.side == 'A' else 'Under'} {r.line:g}"
+    team = r.home if r.side == 'A' else r.away
+    if r.market == 'SPREAD':
+        return f"{team} {r.line if r.side == 'A' else -r.line:+g}"
+    return f"{team} to win"
 
 
-def recent_games(conn, limit=200):
-    return pd.read_sql_query(
-        """SELECT game_date, away || ' @ ' || home AS game, market, line, odds_a, odds_b,
-                  ROUND(pred_away, 1) || '-' || ROUND(pred_home, 1) AS predicted,
-                  ROUND(p_a, 3) AS p_a, ROUND(MAX(ev_a, ev_b), 3) AS best_ev,
-                  CASE pick WHEN 'A' THEN CASE market WHEN 'TOTAL' THEN 'OVER' ELSE home END
-                            WHEN 'B' THEN CASE market WHEN 'TOTAL' THEN 'UNDER' ELSE away END
-                            ELSE 'PASS' END AS pick,
-                  away_pts || '-' || home_pts AS final, result
-           FROM game_log ORDER BY game_date DESC, id DESC LIMIT ?""", conn, params=(limit,))
+def tracked_games(conn, show='All', today=None):
+    """Display table of tracked game lines, newest game first."""
+    df = _filter(_game_rows(conn), show).sort_values(['game_date', 'id'], ascending=False)
+    return pd.DataFrame([{
+        'id': r.id,
+        'Date': r.game_date,
+        'Away': r.away,
+        'Home': r.home,
+        'Bet': f"{_game_side_label(r)} ({int(r.odds):+d})",
+        'Type': 'Bet' if r.is_bet else 'Lean',
+        'Predicted': f"{r.pred_away:.1f} – {r.pred_home:.1f}",
+        'Model %': r.p_side,
+        'EV': r.ev,
+        'Final': f"{r.away_pts:.0f} – {r.home_pts:.0f}" if pd.notna(r.home_pts) else '',
+        'Result': _result_text(r, today),
+        'Profit (u)': r.profit,
+    } for r in df.itertuples()], columns=TABLE_COLUMNS['games'])
+
+
+# ---------------------------------------------------------------------------
+
+def _filter(df, show):
+    if show == 'Pending':
+        return df[df['status'] == PENDING]
+    if show == 'Finished':
+        return df[df['status'] != PENDING]
+    return df
+
+
+TABLE_COLUMNS = {
+    'props': ['id', 'Date', 'Player', 'Bet', 'Type', 'vs', 'Projection', 'Model %', 'EV', 'Actual', 'Result',
+              'Profit (u)'],
+    'games': ['id', 'Date', 'Away', 'Home', 'Bet', 'Type', 'Predicted', 'Model %', 'EV', 'Final', 'Result',
+              'Profit (u)'],
+}
+
+
+def _result_text(r, today):
+    """Pending rows say whether the game is still ahead or just waiting on the data update."""
+    if r.status != PENDING:
+        return r.status
+    return AWAITING if r.game_date < (today or date.today()).isoformat() else PENDING
