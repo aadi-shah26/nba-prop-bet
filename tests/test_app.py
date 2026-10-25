@@ -32,6 +32,10 @@ def _w(widgets, label):
     return next(w for w in widgets if w.label == label)
 
 
+def _bet_verdict(at, text):
+    return any('class="verdict bet"' in m.value and text in m.value for m in at.markdown)
+
+
 def _game_date(conn):
     d = [r[0] for r in conn.execute("SELECT DISTINCT game_date FROM team_games WHERE season = 2025 "
                                     "ORDER BY game_date")][40]
@@ -55,7 +59,7 @@ def test_prop_and_game_flow(app_db):
     _w(at.button, 'Evaluate prop').click()
     at.run()
     assert not at.exception and not at.error
-    assert any('BET OVER' in s.value for s in at.success)       # ~25 ppg scorer vs 18.5
+    assert _bet_verdict(at, 'Over 18.5')                         # ~25 ppg scorer vs 18.5
 
     _w(at.selectbox, 'Away team').set_value(away)
     _w(at.selectbox, 'Home team').set_value(home)
@@ -65,7 +69,7 @@ def test_prop_and_game_flow(app_db):
     _w(at.button, 'Evaluate game').click()
     at.run()
     assert not at.exception and not at.error
-    assert any(f'{home} win chance' == m.label for m in at.metric)
+    assert any(f'{home} win chance' in m.value for m in at.markdown)
     assert app_db.execute("SELECT COUNT(*) FROM prop_log").fetchone()[0] == 1
     assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 2
 
@@ -171,7 +175,7 @@ def test_odds_api_import_flow(app_db, monkeypatch):
     _w(at.button, 'Evaluate imported prop').click()
     at.run()
     assert not at.exception and not at.error
-    assert any('BET OVER' in s.value for s in at.success)       # ~25 ppg scorer vs 18.5
+    assert _bet_verdict(at, 'Over 18.5')                         # ~25 ppg scorer vs 18.5
     assert app_db.execute("SELECT book, opponent, line FROM prop_log").fetchone() == ('draftkings', away, 18.5)
 
     at.date_input(key='oa_gdate').set_value(date.fromisoformat(d))
@@ -218,9 +222,9 @@ def test_track_this_and_tracked_tab(app_db):
     at.run()
     assert not at.exception
     assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (1,)
-    assert any('Tracked' in s.value for s in at.success)
-    table = next(t.value for t in at.dataframe if 'Player' in t.value)   # Tracked bets tab
-    assert list(table['Player']) == [f"{home} Player0"] and table['Result'][0] == '⌛ Awaiting result'
+    assert any('pill pos">Tracked' in m.value for m in at.markdown)
+    table = next(m.value for m in at.markdown if 'table class="trk"' in m.value)   # Tracked bets tab
+    assert f"{home} Player0" in table and 'Awaiting result' in table
     at.button(key='untrack_prop').click()
     at.run()
     assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (0,)

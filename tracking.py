@@ -15,7 +15,8 @@ import pandas as pd
 
 from odds import american_to_decimal
 
-PENDING, HIT, MISS, PUSH, VOID = '⏳ Pending', '✅ Hit', '❌ Miss', '➖ Push', '🚫 Void (DNP)'
+PENDING, HIT, MISS, PUSH, VOID = 'Pending', 'Hit', 'Miss', 'Push', 'Void (DNP)'
+AWAITING = 'Awaiting result'
 
 
 def _record(df, odds_col, ev_col):
@@ -105,7 +106,8 @@ def tracked_props(conn, show='All', today=None):
         'id': r.id,
         'Date': r.game_date,
         'Player': r.player_name,
-        'Bet': f"{r.stat} {r.side.title()} {r.line:g} ({int(r.odds):+d})" + _lean_note(r),
+        'Bet': f"{r.stat} {r.side.title()} {r.line:g} ({int(r.odds):+d})",
+        'Type': 'Bet' if r.is_bet else 'Lean',
         'vs': r.opponent or '',
         'Projection': round(r.proj_mean, 1),
         'Model %': r.p_side,
@@ -166,8 +168,10 @@ def tracked_games(conn, show='All', today=None):
     return pd.DataFrame([{
         'id': r.id,
         'Date': r.game_date,
-        'Game': f"{r.away} @ {r.home}",
-        'Bet': f"{_game_side_label(r)} ({int(r.odds):+d})" + _lean_note(r),
+        'Away': r.away,
+        'Home': r.home,
+        'Bet': f"{_game_side_label(r)} ({int(r.odds):+d})",
+        'Type': 'Bet' if r.is_bet else 'Lean',
         'Predicted': f"{r.pred_away:.1f} – {r.pred_home:.1f}",
         'Model %': r.p_side,
         'EV': r.ev,
@@ -188,18 +192,15 @@ def _filter(df, show):
 
 
 TABLE_COLUMNS = {
-    'props': ['id', 'Date', 'Player', 'Bet', 'vs', 'Projection', 'Model %', 'EV', 'Actual', 'Result',
+    'props': ['id', 'Date', 'Player', 'Bet', 'Type', 'vs', 'Projection', 'Model %', 'EV', 'Actual', 'Result',
               'Profit (u)'],
-    'games': ['id', 'Date', 'Game', 'Bet', 'Predicted', 'Model %', 'EV', 'Final', 'Result', 'Profit (u)'],
+    'games': ['id', 'Date', 'Away', 'Home', 'Bet', 'Type', 'Predicted', 'Model %', 'EV', 'Final', 'Result',
+              'Profit (u)'],
 }
-
-
-def _lean_note(r):
-    return '' if r.is_bet else ' · lean (was a PASS)'
 
 
 def _result_text(r, today):
     """Pending rows say whether the game is still ahead or just waiting on the data update."""
     if r.status != PENDING:
         return r.status
-    return '⌛ Awaiting result' if r.game_date < (today or date.today()).isoformat() else PENDING
+    return AWAITING if r.game_date < (today or date.today()).isoformat() else PENDING

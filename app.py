@@ -8,7 +8,7 @@ numbers behind it. Optionally, with an ODDS_API_KEY set, lines can be imported f
 API instead of typed. Evaluations are saved to your log and settled automatically when you
 press "Update data". Opening the app pulls the latest games by itself (at most every
 AUTO_UPDATE_MINUTES), so the data and your tracked bets are current without pressing anything.
-Press "📌 Track this" on any evaluation to follow it in the Tracked bets tab.
+Press "Track this" on any evaluation to follow it in the Tracked bets tab.
 """
 
 import os
@@ -26,8 +26,10 @@ from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate
                         log_game_evals, settle_game_manual, stale_warning, untrack_game_bet)
 from projection_model import PropContext, count_distribution
 from tracking import game_summary, prop_summary, tracked_games, tracked_props
+import ui
 
-st.set_page_config(page_title="NBA Betting Model", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA Betting Model", page_icon=":material/sports_basketball:", layout="wide")
+ui.inject_css()
 
 STAT_LABELS = {
     'PTS': 'Points', 'REB': 'Rebounds', 'AST': 'Assists', 'FG3M': '3-pointers made',
@@ -181,14 +183,15 @@ def lineup_inputs(away, home, game_date):
 
 
 def track_button(tracked_id, label, key, on_track, on_untrack):
-    """"📌 Track this" for an evaluation, or "Tracked" with an undo once it is."""
+    """"Track this" for an evaluation, or a "Tracked" note with an undo once it is."""
     if tracked_id:
-        c1, c2 = st.columns([5, 1])
-        c1.success("📌 Tracked: it settles by itself after the game. See **📒 Tracked bets**.")
-        if c2.button("Untrack", key=f"un{key}", width="stretch"):
+        c1, c2 = st.columns([5, 1], vertical_alignment="center")
+        c1.markdown(f"{ui.pill('Tracked', 'pos')} &nbsp;{ui.esc(label)} · settles by itself after the game, "
+                    "see **Tracked bets**.", unsafe_allow_html=True)
+        if c2.button("Untrack", key=f"un{key}", width="stretch", icon=":material/bookmark_remove:"):
             on_untrack(tracked_id)
             st.rerun()
-    elif st.button(f"📌 Track this: {label}", key=key, type="primary"):
+    elif st.button(f"Track this: {label}", key=key, icon=":material/bookmark_add:"):
         on_track()
         st.rerun()
 
@@ -230,7 +233,7 @@ def auto_update():
         if pull_data(retries=2):
             status.update(label="Data is up to date", state="complete")
         else:
-            status.update(label="Couldn't pull new games, so the saved data is in use. Press 🔄 Update data "
+            status.update(label="Couldn't pull new games, so the saved data is in use. Press Update data "
                                 "to try again.", state="error")
 
 
@@ -254,10 +257,12 @@ version = data_version()
 last_game, n_player_games, _ = version
 
 with st.sidebar:
-    st.header("🏀 NBA Model")
+    ui.show('<div class="brand">NBA Betting Model<small>Props · spreads · totals · moneylines</small></div>')
     if n_player_games:
         days = (date.today() - date.fromisoformat(last_game)).days
-        st.caption(f"Data through **{last_game}** ({days} days ago) · {n_player_games:,} player-games")
+        fresh = ui.pill("Data current", "pos") if days <= 1 else ui.pill(f"Data {days} days old", "warn")
+        ui.show(f"{fresh}")
+        st.caption(f"Games through **{last_game}** · {n_player_games:,} player-games")
     else:
         st.warning("No data yet. Press **Update data** to download the last 3 seasons (~1 minute).")
 
@@ -267,7 +272,7 @@ with st.sidebar:
     if refreshed:
         local = datetime.fromisoformat(refreshed).astimezone()
         st.caption(f"Last pulled {local:%b %d, %I:%M %p}. Opening the app pulls new games automatically.")
-    if st.button("🔄 Update data", width="stretch",
+    if st.button("Update data", width="stretch", icon=":material/refresh:",
                  help="Downloads the latest box scores from stats.nba.com, settles your tracked bets "
                       "and recalibrates the game model. The app also does this by itself when you open it."):
         with st.status("Updating...", expanded=True) as status:
@@ -283,15 +288,16 @@ with st.sidebar:
     save = st.toggle("Record every evaluation for calibration", value=True,
                      help="Quietly saves everything you evaluate (tracked or not) so the Tracked bets tab can "
                           "measure the model against the market without the bias of only counting what you "
-                          "chose to track. Your tracked list only shows what you press 📌 Track this on.")
+                          "chose to track. Your tracked list only shows what you press Track this on.")
     st.caption(f"Database: `{DB_PATH.name}`")
 
 if not n_player_games:
-    st.title("NBA Betting Model")
-    st.info("Press **🔄 Update data** in the sidebar to get started.")
+    ui.app_header("No data yet")
+    st.info("Press **Update data** in the sidebar to get started.")
     st.stop()
 
-tab_prop, tab_game, tab_results = st.tabs(["🎯 Player prop", "🏀 Game", "📒 Tracked bets"])
+ui.app_header(f"Model data through {last_game}")
+tab_prop, tab_game, tab_results = st.tabs(["Player props", "Games", "Tracked bets"])
 
 
 
@@ -300,7 +306,7 @@ tab_prop, tab_game, tab_results = st.tabs(["🎯 Player prop", "🏀 Game", "�
 # ---------------------------------------------------------------------------
 
 def odds_api_prop_panel(players):
-    with st.expander("📡 Import a prop from The Odds API (optional)"):
+    with st.expander("Import a prop from The Odds API (optional)", icon=":material/download:"):
         c1, c2, c3 = st.columns([1, 1, 2])
         d = c1.date_input("Game date", value=date.today(), key="oa_pdate")
         book = c2.selectbox("Book", options=list(odds_fetcher.BOOKS), format_func=odds_fetcher.BOOKS.get,
@@ -309,7 +315,7 @@ def odds_api_prop_panel(players):
                                  default=['player_points'], key="oa_pmarkets",
                                  format_func=lambda m: STAT_LABELS[odds_fetcher.PROP_MARKETS[m]])
         # the game list is free, so it loads by itself for the chosen date (today by default)
-        refresh = st.button("↻ Reload games (free)", key="oa_events")
+        refresh = st.button("Reload games (free)", key="oa_events", icon=":material/refresh:")
         if refresh or st.session_state.get('oa_event_date') != d.isoformat():
             st.session_state['oa_event_date'] = d.isoformat()
             st.session_state.pop('oa_prop_rows', None)
@@ -361,7 +367,7 @@ def odds_api_prop_panel(players):
 
 
 def odds_api_game_panel():
-    with st.expander("📡 Import game lines from The Odds API (optional)"):
+    with st.expander("Import game lines from The Odds API (optional)", icon=":material/download:"):
         c1, c2 = st.columns(2)
         d = c1.date_input("Game date", value=date.today(), key="oa_gdate")
         book = c2.selectbox("Book", options=list(odds_fetcher.BOOKS), format_func=odds_fetcher.BOOKS.get,
@@ -410,7 +416,7 @@ def prop_chart(r):
         x=alt.X('value:O', title=STAT_LABELS.get(r['stat'], r['stat'])),
         y=alt.Y('probability:Q', axis=alt.Axis(format='%'), title='Chance'),
         color=alt.Color('side:N', scale=alt.Scale(domain=['Under', 'Push', 'Over'],
-                                                  range=['#d9534f', '#999999', '#2e9e5b']),
+                                                  range=['#DC6B6B', '#B6BFCC', '#2F9E63']),
                         legend=alt.Legend(orient='top', title=None)),
         tooltip=['value', alt.Tooltip('probability:Q', format='.1%'), 'side'],
     )
@@ -453,15 +459,19 @@ with tab_prop:
     r = st.session_state.get('prop_result')
     if r:
         vs = f" vs {r['opponent']}" if r['opponent'] else ''
-        st.subheader(f"{r['player_name']} ({r['team']}) — {STAT_LABELS.get(r['stat'], r['stat'])} "
-                     f"{r['line']:g}{vs}")
+        ui.title_row(r['player_name'], f"{r['team']} · {STAT_LABELS.get(r['stat'], r['stat'])} {r['line']:g}{vs} · "
+                     f"{r['game_date']}", abbr=r['team'])
         if r['pick'] == 'PASS':
-            st.info(f"**PASS** — neither side clears +{r['min_ev']:.1%} EV")
+            lean = 'OVER' if r['p_over'] >= r['p_under'] else 'UNDER'
+            ui.verdict(False, f"No bet on {r['line']:g}",
+                       meta=f"Neither side clears <b>+{r['min_ev']:.1%}</b> EV. The model leans {lean.lower()}.")
         else:
             odds = r['over_odds'] if r['pick'] == 'OVER' else r['under_odds']
             ev = r['ev_over'] if r['pick'] == 'OVER' else r['ev_under']
-            st.success(f"### BET {r['pick']} {r['line']:g} at {fmt_odds(odds)}  ·  EV {ev:+.1%}  ·  "
-                       f"stake {r['kelly'] / 4:.1%} of bankroll (¼ Kelly)")
+            p_side = r['p_over'] if r['pick'] == 'OVER' else r['p_under']
+            ui.verdict(True, f"{r['pick'].title()} {r['line']:g}", fmt_odds(odds),
+                       f"EV <b>{ev:+.1%}</b> · model <b>{p_side:.0%}</b> · stake "
+                       f"<b>{r['kelly'] / 4:.1%}</b> of bankroll (quarter Kelly)")
         for w in r['warnings']:
             st.warning(w)
         side = r['pick'] if r['pick'] != 'PASS' else ('OVER' if r['p_over'] >= r['p_under'] else 'UNDER')
@@ -470,7 +480,7 @@ with tab_prop:
         try:
             track_button(prop_log_id(conn, r, r['book'], tracked_only=True),
                          f"{side} {r['line']:g} ({fmt_odds(side_odds)})"
-                         + (" · model lean, no edge" if r['pick'] == 'PASS' else ""), "track_prop",
+                         + (" (lean, no edge)" if r['pick'] == 'PASS' else ""), "track_prop",
                          lambda: log_prop(conn, r, r['book'], tracked=True), lambda i: untrack_prop(conn, i))
         finally:
             conn.close()
@@ -479,20 +489,17 @@ with tab_prop:
         m[0].metric("Projection", f"{r['mean']:.1f}", help=f"Standard deviation {r['sd']:.1f}")
         m[1].metric("Fair line", f"{r['fair_line']:g}", help="The x.5 line where over and under are closest to 50/50")
         m[2].metric("Projected minutes", f"{r['minutes_proj']:.1f}")
-        sa = f"{r['season_avg']:.1f}" if r['season_avg'] is not None else "—"
+        sa = f"{r['season_avg']:.1f}" if r['season_avg'] is not None else "–"
         m[3].metric("Season avg", sa, help=f"{r['season_games']} games this season · last 10: "
                                            f"{r['last10_avg']:.1f} · last 5: {r['last5_avg']:.1f}")
 
         left, right = st.columns([1, 1.3])
         with left:
-            table = pd.DataFrame({
-                'Side': ['Over', 'Under'] + (['Push'] if r['p_push'] > 0 else []),
-                'Odds': [fmt_odds(r['over_odds']), fmt_odds(r['under_odds'])] + (['—'] if r['p_push'] > 0 else []),
-                'Model': [pct(r['p_over']), pct(r['p_under'])] + ([pct(r['p_push'])] if r['p_push'] > 0 else []),
-                'Market (no vig)': [pct(r['fair_over']), pct(r['fair_under'])] + (['—'] if r['p_push'] > 0 else []),
-                'EV per $1': [f"{r['ev_over']:+.1%}", f"{r['ev_under']:+.1%}"] + (['—'] if r['p_push'] > 0 else []),
-            })
-            st.dataframe(table, hide_index=True, width="stretch")
+            pick = {'OVER': 0, 'UNDER': 1}.get(r['pick'])
+            ui.odds_table([('Over', fmt_odds(r['over_odds']), pct(r['p_over']), pct(r['fair_over']), r['ev_over']),
+                           ('Under', fmt_odds(r['under_odds']), pct(r['p_under']), pct(r['fair_under']),
+                            r['ev_under'])]
+                          + ([('Push', '–', pct(r['p_push']), '–', '–')] if r['p_push'] > 0 else []), pick)
             opp_txt = ', '.join(f"{c} ×{f:.3f}" for c, f in r['opp_factors'].items())
             st.caption(f"Bookmaker margin on this prop: {r['vig']:.1%}. Opponent adjustment: {opp_txt}. "
                        f"Data through {r['last_game']}.")
@@ -515,10 +522,13 @@ with tab_game:
     home = c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
                         index=None, placeholder="Home")
     gdate = c3.date_input("Game date", value=date.today(), key="gdate")
+    if away and home and away != home:
+        ui.show(f'<div class="title-row">{ui.team(away, 34, teams[away])}<span class="s">at</span>'
+                f'{ui.team(home, 34, teams[home])}</div>')
     lineups = lineup_inputs(away, home, gdate.isoformat())
 
     with st.form("game"):
-        st.caption("Lines are optional — leave blank to just get the predicted score.")
+        st.caption("Lines are optional. Leave them blank to just get the predicted score.")
         c1, c2, c3 = st.columns(3)
         with c1:
             st.markdown("**Spread** (home team's line)")
@@ -564,45 +574,50 @@ with tab_game:
     if res:
         pred, evals, stale, calibrated, gd, book = res
         h, a = pred['home'], pred['away']
-        st.subheader(f"{a} @ {h}  ·  {gd}")
-        m = st.columns(4)
-        m[0].metric(f"{a} (away)", f"{pred['pred_away']:.1f}")
-        m[1].metric(f"{h} (home)", f"{pred['pred_home']:.1f}")
-        m[2].metric("Total", f"{pred['total']:.1f}", help=f"Projected pace {pred['pace']:.1f} possessions")
-        m[3].metric(f"{h} win chance", pct(pred['p_home_win']),
-                    help=f"Fair spread: {h} {-pred['margin']:+.1f}")
+        st.write("")
+        ui.matchup(a, h, team_options(), pred, gd)
+        notes = [f"Projected pace {pred['pace']:.1f} possessions."]
         adj = adjustment_text(pred)
         if adj:
-            st.caption(f"Adjustments to the {h} margin: {adj}")
+            notes.append(f"Adjustments to the {h} margin: {adj}")
+        if not calibrated:
+            notes.append("Score spreads use default values until the first data update calibrates them.")
+        st.caption(" ".join(notes))
         if stale:
             st.warning(stale)
-        if not calibrated:
-            st.caption("Score spreads use default values until the first data update calibrates them.")
 
         names = {'SPREAD': (h, a), 'TOTAL': ('Over', 'Under'), 'MONEYLINE': (h, a)}
-        for e in evals:
+        for col, e in zip(st.columns(max(len(evals), 1)), evals):
             sa, sb = names[e['market']]
             if e['market'] == 'SPREAD':
-                title = f"Spread: {h} {e['line']:+g} / {a} {-e['line']:+g}"
+                title = "Spread"
                 sa, sb = f"{h} {e['line']:+g}", f"{a} {-e['line']:+g}"
             elif e['market'] == 'TOTAL':
                 title = f"Total {e['line']:g}"
+                sa, sb = f"Over {e['line']:g}", f"Under {e['line']:g}"
             else:
                 title = "Moneyline"
-            with st.container(border=True):
+                sa, sb = f"{h} to win", f"{a} to win"
+            with col.container(border=True):
                 st.markdown(f"**{title}**")
                 if e['pick'] == 'PASS':
-                    st.info(f"PASS — neither side clears +{min_ev:.1%} EV")
+                    lean = sa if e['p_a'] >= e['p_b'] else sb
+                    ui.verdict(False, "No bet", meta=f"Neither side clears <b>+{min_ev:.1%}</b> EV. "
+                                                    f"Model leans {ui.esc(lean)}.")
                 else:
-                    side, odds, ev = (sa, e['odds_a'], e['ev_a']) if e['pick'] == 'A' else (sb, e['odds_b'], e['ev_b'])
-                    st.success(f"**BET {side}** at {fmt_odds(odds)} · EV {ev:+.1%} · "
-                               f"stake {e['kelly'] / 4:.1%} of bankroll (¼ Kelly)")
+                    side, odds, ev, p = ((sa, e['odds_a'], e['ev_a'], e['p_a']) if e['pick'] == 'A'
+                                         else (sb, e['odds_b'], e['ev_b'], e['p_b']))
+                    ui.verdict(True, side, fmt_odds(odds), f"EV <b>{ev:+.1%}</b> · model <b>{p:.0%}</b> · stake "
+                                                         f"<b>{e['kelly'] / 4:.1%}</b> (quarter Kelly)",
+                               abbr=None if e['market'] == 'TOTAL' else (h if e['pick'] == 'A' else a))
                 if e['warning']:
                     st.warning(e['warning'])
+                ui.odds_table([(sa, fmt_odds(e['odds_a']), pct(e['p_a']), pct(e['fair_a']), e['ev_a']),
+                               (sb, fmt_odds(e['odds_b']), pct(e['p_b']), pct(1 - e['fair_a']), e['ev_b'])],
+                              {'A': 0, 'B': 1}.get(e['pick']))
                 lean = e['pick'] if e['pick'] != 'PASS' else ('A' if e['p_a'] >= e['p_b'] else 'B')
-                label = (f"{sa if lean == 'A' else sb}{' to win' if e['market'] == 'MONEYLINE' else ''} "
-                         f"({fmt_odds(e['odds_a'] if lean == 'A' else e['odds_b'])})"
-                         + (" · model lean, no edge" if e['pick'] == 'PASS' else ""))
+                label = (f"{sa if lean == 'A' else sb} ({fmt_odds(e['odds_a'] if lean == 'A' else e['odds_b'])})"
+                         + (" (lean, no edge)" if e['pick'] == 'PASS' else ""))
                 conn = db()
                 try:
                     track_button(game_log_id(conn, gd, pred, e, book, tracked_only=True), label,
@@ -611,13 +626,6 @@ with tab_game:
                                  lambda i: untrack_game_bet(conn, i))
                 finally:
                     conn.close()
-                st.dataframe(pd.DataFrame({
-                    'Side': [sa, sb],
-                    'Odds': [fmt_odds(e['odds_a']), fmt_odds(e['odds_b'])],
-                    'Model': [pct(e['p_a']), pct(e['p_b'])],
-                    'Market (no vig)': [pct(e['fair_a']), pct(1 - e['fair_a'])],
-                    'EV per $1': [f"{e['ev_a']:+.1%}", f"{e['ev_b']:+.1%}"],
-                }), hide_index=True, width="stretch")
 
 
 # ---------------------------------------------------------------------------
@@ -729,65 +737,57 @@ def tracked_metrics(s):
     acc, rec = s['accuracy'], s['record']
     c = st.columns(5)
     c[0].metric("Tracked", s['tracked'], help=f"{s['pending']} waiting on the game")
-    c[1].metric("Model's side hit", f"{acc['rate']:.0%}" if acc['rate'] is not None else "—",
+    c[1].metric("Model's side hit", f"{acc['rate']:.0%}" if acc['rate'] is not None else "–",
                 help=f"{acc['hits']} hit, {acc['misses']} missed (pushes and voids left out). "
                      "Includes tracked passes, judged on the side the model leaned to.")
-    c[2].metric("Record (W-L-P)", f"{rec['wins']}-{rec['losses']}-{rec['pushes']}" if rec else "—",
-                help="Tracked bets only (a tracked PASS isn't a bet)")
-    c[3].metric("Profit", f"{rec['profit']:+.2f} u" if rec else "—", help="1 unit staked per bet")
-    c[4].metric("ROI", f"{rec['roi']:+.1%}" if rec else "—",
+    c[2].metric("Record (W-L-P)", f"{rec['wins']}-{rec['losses']}-{rec['pushes']}" if rec else "–",
+                help="Tracked bets only (a tracked pass isn't a bet)")
+    c[3].metric("Profit", f"{rec['profit']:+.2f} u" if rec else "–", help="1 unit staked per bet")
+    c[4].metric("ROI", f"{rec['roi']:+.1%}" if rec else "–",
                 help=f"Model's claimed average EV on these: {rec['claimed_ev']:+.1%}" if rec else None)
-
-
-def tracked_table(df, empty):
-    if df.empty:
-        st.caption(empty)
-        return
-    df = df.assign(**{'Model %': df['Model %'] * 100, 'EV': df['EV'] * 100})
-    st.dataframe(df, hide_index=True, width="stretch", column_order=[c for c in df.columns if c != 'id'],
-                 column_config={'Model %': st.column_config.NumberColumn(format="%.0f%%",
-                                                                         help="Model's chance for this side"),
-                                'EV': st.column_config.NumberColumn(format="%+.1f%%"),
-                                'Profit (u)': st.column_config.NumberColumn(format="%+.2f")})
 
 
 with tab_results:
     summary_area = st.container()
-    st.divider()
-    with st.expander("✍️ Enter a result by hand, stop tracking, or delete"):
+    st.write("")
+    with st.expander("Enter a result by hand, stop tracking, or delete", icon=":material/edit_note:"):
         manual_settle_section()
     conn = db()
     try:
         ps, gs = prop_summary(conn), game_summary(conn)
-        show = st.session_state.get('track_show', 'All')
+        show = st.session_state.get('track_show') or 'All'
         props_df, games_df = tracked_props(conn, show), tracked_games(conn, show)
     finally:
         conn.close()
 
     with summary_area:
-        c1, c2 = st.columns([4, 1])
-        c1.caption("Press **📌 Track this** on any prop or game line. Once the game is over, the result fills in "
-                   "here by itself when the app pulls new games (on opening it, or with **🔄 Update data**).")
-        if c2.button("🔄 Check for results", width="stretch", key="check_results"):
+        c1, c2 = st.columns([4, 1], vertical_alignment="center")
+        c1.caption("Press **Track this** on any prop or game line. Once the game is over, the result fills in "
+                   "here by itself when the app pulls new games (on opening it, or with **Update data**).")
+        if c2.button("Check for results", width="stretch", key="check_results", icon=":material/refresh:"):
             with st.status("Pulling the latest games...", expanded=True) as status:
                 ok = pull_data()
                 status.update(label="Up to date" if ok else "Update failed", state="complete" if ok else "error")
             if ok:
                 st.rerun()
-        st.radio("Show", ["All", "Pending", "Finished"], horizontal=True, key="track_show")
+        st.segmented_control("Show", ["All", "Pending", "Finished"], default="All", key="track_show",
+                             label_visibility="collapsed")
 
-        st.markdown("#### 🎯 Props")
-        tracked_metrics(ps)
-        tracked_table(props_df, "Nothing here yet." if show == 'All' else f"No {show.lower()} props.")
-        st.markdown("#### 🏀 Game lines")
-        tracked_metrics(gs)
-        tracked_table(games_df, "Nothing here yet." if show == 'All' else f"No {show.lower()} game lines.")
+        for title, summ, df, table, noun in (("Props", ps, props_df, ui.props_table, "props"),
+                                            ("Game lines", gs, games_df, ui.games_table, "game lines")):
+            st.subheader(title)
+            tracked_metrics(summ)
+            if df.empty:
+                st.caption("Nothing tracked yet." if show == 'All' else f"No {show.lower()} {noun}.")
+            else:
+                table(df)
 
         cal = ps.get('calibration')
         if cal:
             better = cal['brier_model'] < cal['brier_market']
-            st.markdown(f"**Model vs market** on **{cal['n']}** settled props you evaluated, tracked or not (lower "
-                        f"Brier score = better forecaster): model **{cal['brier_model']:.4f}**, market "
-                        f"**{cal['brier_market']:.4f}** → {'✅ model better' if better else '❌ market better'}"
-                        + (" *(too few to mean much yet)*" if cal['n'] < 100 else ""))
+            st.subheader("Model vs market")
+            ui.show(f"{ui.pill('Model better' if better else 'Market better', 'pos' if better else 'neg')} "
+                    f"&nbsp;Brier score on <b>{cal['n']}</b> settled props you evaluated, tracked or not: model "
+                    f"<b>{cal['brier_model']:.4f}</b>, market <b>{cal['brier_market']:.4f}</b> (lower is better)."
+                    + (" <i>Too few to mean much yet.</i>" if cal['n'] < 100 else ""))
         st.caption("A real edge takes a few hundred bets to show up. Under ~100 the record is mostly luck.")

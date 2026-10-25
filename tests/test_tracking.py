@@ -49,8 +49,8 @@ def test_prop_tracking_statuses_and_record(league_conn):
     t = tracked_props(league_conn).set_index('Bet')
     assert t.loc[f"PTS Over {actual - 0.5:g} (-110)", 'Result'] == HIT
     assert t.loc[f"PTS Over {actual + 0.5:g} (-110)", 'Profit (u)'] == -1
-    lean_row = t.loc[f"PTS Over {actual - 1.5:g} (-110) · lean (was a PASS)"]
-    assert lean_row['Result'] == HIT and math.isnan(lean_row['Profit (u)'])
+    lean_row = t.loc[f"PTS Over {actual - 1.5:g} (-110)"]
+    assert lean_row['Type'] == 'Lean' and lean_row['Result'] == HIT and math.isnan(lean_row['Profit (u)'])
     assert sorted(t['Result']) == sorted([HIT, MISS, HIT, VOID, PENDING])
     assert list(tracked_props(league_conn, 'Pending')['Date']) == ['2099-01-01']
     assert len(tracked_props(league_conn, 'Finished')) == 4
