@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS game_log (
     game_date   TEXT NOT NULL,
     home        TEXT NOT NULL,
     away        TEXT NOT NULL,
-    market      TEXT NOT NULL,           -- 'SPREAD' (home line) | 'TOTAL' | 'MONEYLINE'
+    market      TEXT NOT NULL,           -- 'SPREAD' (home line) | 'TOTAL' | 'MONEYLINE' | 'WINNER' (pick, no line; odds 0)
     line        REAL,                    -- home spread or total; NULL for moneyline
     odds_a      INTEGER NOT NULL,        -- home side / over
     odds_b      INTEGER NOT NULL,        -- away side / under

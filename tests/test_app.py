@@ -19,6 +19,7 @@ st_testing = pytest.importorskip('streamlit.testing.v1')
 def app_db(tmp_path, monkeypatch):
     # The Odds API panels are off unless a key is configured; keep them off by default.
     monkeypatch.delenv('ODDS_API_KEY', raising=False)
+    monkeypatch.setenv('NBA_INJURIES', '0')   # no live injury feed in tests
     monkeypatch.setattr(odds_fetcher, 'ENV_FILE', tmp_path / 'no.env')
     path = tmp_path / 'app.db'
     conn = db.connect(path)
@@ -110,14 +111,67 @@ def test_slate_opens_game(app_db):
     at.button(key=f'slate_{gid}').click()
     at.run()
     assert not at.exception and not at.error
-    assert any(b.label == 'Close' for b in at.button)                # the opened game's section
+    assert any(b.label == 'All games' for b in at.button)            # the opened game's section
+    assert not any(b.label == 'Open' for b in at.button)             # ...replaces the list
     assert any(b.label == 'Evaluate game' for b in at.button)
     assert any(f'{home} win chance' in m.value for m in at.markdown)
     assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0   # no lines, nothing logged
-    _w(at.button, 'Close').click()
+    _w(at.button, 'All games').click()
     at.run()
     assert not any(b.label == 'Evaluate game' for b in at.button)
     assert not any(f'{home} win chance' in m.value for m in at.markdown)
+    assert any(b.label == 'Open' for b in at.button)
+
+
+def test_track_pick_from_slate(app_db):
+    d, home, away = _game_date(app_db)
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    at.date_input[1].set_value(date.fromisoformat(d))
+    at.run()
+    assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0   # nothing until you track
+    gid = app_db.execute("SELECT game_id FROM schedule WHERE game_date=? AND home=?", (d, home)).fetchone()[0]
+    at.button(key=f'slate_track_{gid}').click()
+    at.run()
+    assert not at.exception
+    assert app_db.execute("SELECT market, tracked, home, away FROM game_log").fetchall() == \
+        [('WINNER', 1, home, away)]
+    assert at.session_state['main_tab'] == 'Tracked bets'           # jumps to the tracked list
+    games = next(df.value for df in at.dataframe if 'Home logo' in df.value.columns)
+    assert list(games['Type']) == ['Pick'] and games['Bet'][0].endswith(' to win')
+    at.button(key=f'slate_untrack_{gid}').click()                   # the card now says Tracked
+    at.run()
+    assert app_db.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0
+
+
+def test_add_to_tracked(app_db):
+    d, home, away = _game_date(app_db)
+    pid = app_db.execute("SELECT player_id FROM player_games WHERE team=? ORDER BY minutes DESC",
+                         (home,)).fetchone()[0]
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    at.date_input(key='add_gdate').set_value(date.fromisoformat(d))
+    at.run()
+    at.radio(key='add_market').set_value('Total')
+    at.run()
+    at.button(key='add_game_go').click()
+    at.run()
+    assert any('Enter the line' in e.value for e in at.error)
+    at.number_input(key='add_line').set_value(220.5)
+    at.button(key='add_game_go').click()
+    at.run()
+    assert not at.exception
+    assert app_db.execute("SELECT market, line, tracked FROM game_log").fetchall() == [('TOTAL', 220.5, 1)]
+
+    at.segmented_control(key='add_kind').set_value('Prop')
+    at.run()
+    at.selectbox(key='add_player').set_value(pid)
+    at.number_input(key='add_pline').set_value(18.5)
+    at.date_input(key='add_pdate').set_value(date.fromisoformat(d))
+    at.button(key='FormSubmitter:add_prop-Track').click()
+    at.run()
+    assert not at.exception
+    assert app_db.execute("SELECT stat, line, tracked FROM prop_log").fetchall() == [('PTS', 18.5, 1)]
+    props = next(df.value for df in at.dataframe if 'Player' in df.value.columns)
+    assert f"{home} Player0" in list(props['Player'])
 
 
 def test_slate_jumps_to_next_game_day(app_db):
@@ -292,8 +346,9 @@ def test_track_this_and_tracked_tab(app_db):
     assert not at.exception
     assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (1,)
     assert any('pill pos">Tracked' in m.value for m in at.markdown)
-    table = next(m.value for m in at.markdown if 'table class="trk"' in m.value)   # Tracked bets tab
-    assert f"{home} Player0" in table and 'Awaiting result' in table
+    assert at.session_state['main_tab'] == 'Tracked bets'
+    props = next(df.value for df in at.dataframe if 'Player' in df.value.columns)   # Tracked bets tab
+    assert list(props['Player']) == [f"{home} Player0"] and list(props['Result']) == ['Awaiting result']
     at.button(key='untrack_prop').click()
     at.run()
     assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (0,)

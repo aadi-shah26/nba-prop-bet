@@ -9,7 +9,6 @@ circle in the team's colour. NBA_LOGOS=0 skips downloading.
 
 import base64
 import html
-import math
 import os
 import time
 from functools import lru_cache
@@ -243,55 +242,11 @@ Fair spread {esc(home)} {-pred['margin']:+.1f}</div>
 
 
 # ---------------------------------------------------------------------------
-# Tracked-bets tables
+# Tables
 # ---------------------------------------------------------------------------
-
-RESULT_TONES = {'Hit': 'pos', 'Miss': 'neg', 'Push': 'flat', 'Void (DNP)': 'flat',
-                'Pending': 'accent', 'Awaiting result': 'warn'}
-
-
-def _num(x, fmt, dim='–'):
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return f'<span class="dim">{dim}</span>'
-    return format(x, fmt)
-
-
-def _profit(x):
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return '<span class="dim">–</span>'
-    return f'<span class="{"pos-txt" if x > 0 else "neg-txt" if x < 0 else ""}">{x:+.2f}</span>'
-
-
-def _bet_cell(r):
-    lean = ' <span class="pill flat">Lean</span>' if r['Type'] == 'Lean' else ''
-    return f"{esc(r['Bet'])}{lean}"
-
 
 def _table(head, rows, cls=''):
     th = ''.join(f'<th class="{c}">{esc(h)}</th>' for h, c in head)
     body = ''.join('<tr>' + ''.join(f'<td class="{c}">{cell}</td>' for cell, (_, c) in zip(row, head)) + '</tr>'
                    for row in rows)
     show(f'<div class="tbl-wrap"><table class="{f"trk {cls}".strip()}"><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>')
-
-
-def props_table(df):
-    head = [('Date', ''), ('Player', ''), ('Bet', ''), ('Opp', ''), ('Proj', 'r'), ('Model', 'r'),
-            ('EV', 'r'), ('Actual', 'r'), ('Result', ''), ('Units', 'r')]
-    _table(head, [[
-        esc(r['Date']), esc(r['Player']), _bet_cell(r), team(r['vs'], 20) if r['vs'] else '<span class="dim">–</span>',
-        _num(r['Projection'], '.1f'), _num(r['Model %'], '.0%'), _num(r['EV'], '+.1%'), _num(r['Actual'], 'g'),
-        pill(r['Result'], RESULT_TONES.get(r['Result'], 'flat')), _profit(r['Profit (u)']),
-    ] for _, r in df.iterrows()])
-
-
-def games_table(df):
-    head = [('Date', ''), ('Game', ''), ('Bet', ''), ('Predicted', 'r'), ('Model', 'r'), ('EV', 'r'),
-            ('Final', 'r'), ('Result', ''), ('Units', 'r')]
-    _table(head, [[
-        esc(r['Date']),
-        f'<span class="team">{logo(r["Away"], 20)}<span>{esc(r["Away"])}</span>'
-        f'<span class="dim">@</span>{logo(r["Home"], 20)}<span>{esc(r["Home"])}</span></span>',
-        _bet_cell(r), esc(r['Predicted']), _num(r['Model %'], '.0%'), _num(r['EV'], '+.1%'),
-        esc(r['Final']) if r['Final'] else '<span class="dim">–</span>',
-        pill(r['Result'], RESULT_TONES.get(r['Result'], 'flat')), _profit(r['Profit (u)']),
-    ] for _, r in df.iterrows()])

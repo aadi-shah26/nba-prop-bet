@@ -44,25 +44,32 @@ Stats: points, rebounds, assists, 3-pointers made, PRA, PR, PA, RA, steals, bloc
 steals+blocks, turnovers.
 
 **Games** — the day's games are listed at the top (from the NBA schedule, refreshed
-automatically), each with the model's predicted winner. Click **Open** on one to load it, or
-add a custom matchup (their logos appear once loaded). Leave the lines blank to just get the
+automatically), each with the model's predicted winner. **Track pick** follows that pick in
+Tracked bets with no betting line needed. **Open** replaces the list with that game (**All
+games** goes back), or add a custom matchup. Leave the lines blank to just get the
 predicted score and win probability, or fill in any of spread (the **home** team's line), total
 and moneyline to get a pick for each. Once a game is open, a **who's playing tonight** checklist
-appears for each team (best players first; check the injury report). Everyone from the team's
-last 10 games starts ticked, so untick anyone who's out. Players who haven't played lately
+appears for each team (best players first). Everyone from the team's last 10 games starts
+ticked, except players today's injury report (ESPN) lists as **Out**, who start unticked and are
+also left out of the predictions on the game cards; *Day-To-Day* players are flagged but stay
+ticked. Check for late scratches. Players who haven't played lately
 (injured, out of the rotation) start unticked, so tick anyone returning. The result shows the
 lineup and back-to-back adjustments it applied.
 
-**Track this** — under every prop and game-line result. Tracking a PASS follows the side the
-model leaned to. Press **Untrack** to undo.
+**Track this** — under every prop and game-line result, and under an opened game's prediction
+(the model's pick, no line). Tracking a PASS follows the side the model leaned to. Tracking
+anything switches to the Tracked bets tab. Press **Untrack** to undo.
 
 **Tracked bets** — everything you tracked, newest first, filterable by *Pending* / *Finished*.
-Each row shows the bet, the model's chance and EV, the actual stat or final score, and
-a coloured Hit / Miss / Push / Void (DNP) tag with the profit in units. *Awaiting result* means
+**Add a game or prop to track** at the top tracks one without opening it first. Each row shows
+the bet, the model's chance and EV, the actual stat or final score, and Hit / Miss / Push / Void
+(DNP) with the profit in units. Tick rows to **Remove** them (stops tracking, keeps the
+evaluation for calibration) or **Delete** them for good. A winner *Pick* has no odds, so it
+counts toward the hit rate but not profit. *Awaiting result* means
 the game is over but its box score isn't in yet; **Check for results** pulls it. Above each
 table: how often the model's side hit, plus record, profit and ROI on the actual bets (a tracked
-PASS counts toward the hit rate but not the profit). The expander at the bottom lets you enter a
-result by hand, stop tracking, or delete.
+PASS counts toward the hit rate but not the profit). The expander at the bottom lets you enter or
+fix a result by hand.
 
 The sidebar switch **Record every evaluation for calibration** (on by default) also quietly
 saves what you *don't* track. The model-vs-market Brier score uses all of it, because grading
@@ -202,6 +209,7 @@ and rest (projections lag sudden role changes — April is the weakest month), t
 | `app.py`, `start.command` | The web app and its Mac launcher |
 | `fetch_game_logs.py` | League-wide player + team game logs from stats.nba.com |
 | `daily_update.py` | Refresh current season, settle logged bets, recalibrate game model, refresh schedule |
+| `nba_injuries.py` | Today's injury report (ESPN), used for the playing/out defaults (`NBA_INJURIES=0` turns it off) |
 | `nba_schedule.py` | Season schedule incl. upcoming games (for the Game tab's list of today's games) |
 | `feature_engineering.py` | Shared numeric core (rates, minutes, opponent factors, dispersion) |
 | `projection_model.py` | Distributions, fair lines, projection CLI |

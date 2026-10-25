@@ -20,11 +20,13 @@ import pandas as pd
 import streamlit as st
 
 from bet_signals import delete_prop, evaluate_prop, log_prop, prop_log_id, settle_prop_manual, untrack_prop
+import nba_injuries
 import nba_schedule
 import odds_fetcher
 from db import DB_PATH, connect, get_meta, init_db, recent_players, season_for_date, set_meta
-from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate_markets, explain_game,
-                        game_log_id, log_game_evals, settle_game_manual, stale_warning, untrack_game_bet)
+from game_model import (WINNER, GameContext, adjustment_text, delete_game_bets, evaluate_markets, explain_game,
+                        delete_game_bet, game_log_id, log_game_evals, pick_id, settle_game_manual,
+                        stale_warning, track_pick, untrack_game_bet)
 from projection_model import PropContext, count_distribution
 from tracking import game_summary, prop_summary, tracked_games, tracked_props
 import ui
@@ -38,6 +40,7 @@ STAT_LABELS = {
     'STL': 'Steals', 'BLK': 'Blocks', 'SB': 'Steals + Blocks', 'TOV': 'Turnovers',
 }
 AUTO_UPDATE_MINUTES = 30    # opening the app pulls new games at most this often
+TABS = ["Player props", "Games", "Tracked bets"]
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +115,35 @@ def slate(game_date):
         conn.close()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def injury_report():
+    """Today's injury report (ESPN), or None if it can't be fetched. NBA_INJURIES=0 turns it off."""
+    if os.getenv('NBA_INJURIES', '1') == '0':
+        return None
+    try:
+        return nba_injuries.normalize_injuries(nba_injuries.fetch_injuries())
+    except Exception:  # offline, feed changed: the checklists just start from recent games
+        return None
+
+
+def injuries_for(ctx, game_date):
+    """For today's and upcoming games, a function team -> {player_id: (status, comment)} from
+    the injury report; None for past dates (it describes today) or when it's unavailable."""
+    rep = injury_report() if game_date >= date.today().isoformat() else None
+    if rep is None:
+        return None
+    return lambda team: nba_injuries.match_roster(rep, ctx.roster(team), team)
+
+
+def report_outs(ctx, game_date, home, away):
+    """evaluate() kwargs marking the injury report's Out players as not playing."""
+    inj = injuries_for(ctx, game_date)
+    if not inj:
+        return {}
+    return {f'{side}_out': [i for i, (status, _) in inj(team).items() if status == nba_injuries.OUT]
+            for side, team in (('home', home), ('away', away))}
+
+
 def fmt_odds(o):
     return f"{int(o):+d}"
 
@@ -175,13 +207,20 @@ def lineup_inputs(away, home, game_date):
     if not ctx.use_lineups:
         st.caption("Playoffs: the lineup adjustment is off (it made playoff picks worse in testing).")
         return res
-    st.markdown("**Who's playing tonight?** Check the injury report. Untick anyone who's out, "
-                "and tick anyone returning who hasn't played lately. Best players are listed first.")
+    inj = injuries_for(ctx, game_date)
+    if inj:
+        st.markdown("**Who's playing tonight?** Players on today's injury report as **Out** start unticked. "
+                    "Check late scratches, and tick anyone returning who hasn't played lately. Best players "
+                    "are listed first.")
+    else:
+        st.markdown("**Who's playing tonight?** Check the injury report. Untick anyone who's out, "
+                    "and tick anyone returning who hasn't played lately. Best players are listed first.")
     if ctx.roster_date:
         st.caption(f"Rosters as of {ctx.roster_date} (trades and signings included). Players with no NBA "
                    "games yet, like rookies, aren't listed: the model has no value for them.")
     for col, team, side in zip(st.columns(2), (away, home), ('away', 'home')):
         r = ctx.roster(team)
+        report = inj(team) if inj else {}
         with col.container(border=True):
             st.markdown(f"**{team}**")
             for recent, heading in ((True, None), (False, "Haven't played lately")):
@@ -191,8 +230,12 @@ def lineup_inputs(away, home, game_date):
                 if heading:
                     st.caption(heading)
                 for p in group.itertuples():
-                    on = st.checkbox(p.player_name, value=recent, key=f"play_{team}_{p.player_id}_{game_date}",
-                                     help=f"Value {p.value:.1f} (recent Game Score) · last played {p.last_game}")
+                    status, comment = report.get(int(p.player_id), (None, ''))
+                    on = st.checkbox(p.player_name + (f" ({status})" if status else ""),
+                                     value=recent and status != nba_injuries.OUT,
+                                     key=f"play_{team}_{p.player_id}_{game_date}",
+                                     help=(f"{status}: {comment}  \n" if status else "")
+                                     + f"Value {p.value:.1f} (recent Game Score) · last played {p.last_game}")
                     if recent and not on:
                         res[f'{side}_out'].append(int(p.player_id))
                     elif on and not recent:
@@ -211,7 +254,13 @@ def track_button(tracked_id, label, key, on_track, on_untrack):
             st.rerun()
     elif st.button(f"Track this: {label}", key=key, icon=":material/bookmark_add:"):
         on_track()
+        tracked_go(f"Tracking {label}")
         st.rerun()
+
+
+def tracked_go(msg):
+    """After tracking something: switch to the Tracked bets tab and say what was added."""
+    st.session_state.update(goto_tab=TABS[2], toast=msg)
 
 
 def pull_data(retries=4):
@@ -315,7 +364,11 @@ if not n_player_games:
     st.stop()
 
 ui.app_header(f"Model data through {last_game}")
-tab_prop, tab_game, tab_results = st.tabs(["Player props", "Games", "Tracked bets"])
+if 'goto_tab' in st.session_state:   # set after tracking; must be applied before the tabs are drawn
+    st.session_state['main_tab'] = st.session_state.pop('goto_tab')
+tab_prop, tab_game, tab_results = st.tabs(TABS, key="main_tab", on_change="rerun")
+if 'toast' in st.session_state:
+    st.toast(st.session_state.pop('toast'), icon=":material/check_circle:")
 
 
 
@@ -562,6 +615,39 @@ def jump_to(d):
     st.session_state['gdate'] = date.fromisoformat(d)
 
 
+def pick_label(pred):
+    fav = pred['home'] if pred['p_home_win'] >= 0.5 else pred['away']
+    return f"{fav} to win ({pred['away']} @ {pred['home']})"
+
+
+def track_pick_cb(game_date, pred):
+    conn = db()
+    try:
+        track_pick(conn, game_date, pred)
+    finally:
+        conn.close()
+    tracked_go(f"Tracking {pick_label(pred)}")
+
+
+def untrack_cb(row_id):
+    conn = db()
+    try:
+        untrack_game_bet(conn, row_id)
+    finally:
+        conn.close()
+
+
+def tracked_picks(game_date):
+    """{(home, away): row id} of the winner picks tracked on `game_date`."""
+    conn = db()
+    try:
+        return {(h, a): i for i, h, a in conn.execute(
+            "SELECT id, home, away FROM game_log WHERE market = ? AND tracked = 1 AND game_date = ?",
+            (WINNER, game_date))}
+    finally:
+        conn.close()
+
+
 def slate_panel(gdate):
     """The day's games from the schedule, each with the model's pick; clicking one loads it below."""
     games, next_day, err = slate(gdate.isoformat())
@@ -580,27 +666,43 @@ def slate_panel(gdate):
         ctx = game_context(gdate.isoformat(), version)
     except Exception:
         ctx = None
-    st.markdown(f"**{len(games)} game{'s' * (len(games) != 1)} on {day_label(gdate)}**: open one "
-                "to check who's playing and add betting lines")
+    st.markdown(f"**{len(games)} game{'s' * (len(games) != 1)} on {day_label(gdate)}**: track the "
+                "model's pick, or open a game to check who's playing and add betting lines")
+    picks = tracked_picks(gdate.isoformat())
     cols = st.columns(3)
     for i, g in enumerate(games.itertuples()):
+        pred = None
         with cols[i % 3].container(border=True):
             ui.show(f'<div class="title-row">{ui.team(g.away, 26)}<span class="s">at</span>'
                     f'{ui.team(g.home, 26)}</div>')
             st.caption(" · ".join(x for x in (g.status, g.label) if x))
             try:
-                pred = ctx.evaluate(g.home, g.away)
+                outs = report_outs(ctx, gdate.isoformat(), g.home, g.away)
+                pred = ctx.evaluate(g.home, g.away, **outs)
+                pred['lineups'] = outs
                 p = pred['p_home_win']
                 fav, pf = (g.home, p) if p >= 0.5 else (g.away, 1 - p)
                 st.markdown(f"Model: **{fav}** {pf:.0%}")
-                why = explain_game(ctx, pred)
+                why = explain_game(ctx, pred, **outs)
                 st.caption(why['summary'])
                 with st.expander(f"Why {fav}?"):
                     st.markdown("\n".join(f"- {d}" for d in why['details']))
             except Exception:  # no ratings for a team yet, etc.
+                pred = None
                 st.markdown("Model: —")
-            st.button("Open", key=f"slate_{g.game_id}", on_click=pick_game, args=(g.away, g.home),
-                      width="stretch")
+            b1, b2 = st.columns(2)
+            b1.button("Open", key=f"slate_{g.game_id}", on_click=pick_game, args=(g.away, g.home),
+                      width="stretch", icon=":material/open_in_full:")
+            tid = picks.get((g.home, g.away))
+            if tid:
+                b2.button("Tracked", key=f"slate_untrack_{g.game_id}", on_click=untrack_cb, args=(tid,),
+                          width="stretch", icon=":material/bookmark_added:", type="primary",
+                          help="You're tracking the model's pick for this game. Click to stop.")
+            elif pred is not None:
+                b2.button("Track pick", key=f"slate_track_{g.game_id}", on_click=track_pick_cb,
+                          args=(gdate.isoformat(), pred), width="stretch", icon=":material/bookmark_add:",
+                          help=f"Follow the model's pick ({pick_label(pred)}) in Tracked bets. It settles "
+                               "by itself after the game.")
 
 
 with tab_game:
@@ -609,34 +711,30 @@ with tab_game:
         odds_api_game_panel()
     st.session_state.setdefault('gdate', date.today())   # set here so callbacks can move it
     gdate = st.date_input("Game date", key="gdate")
-    slate_panel(gdate)
-
-    with st.expander("Add a custom matchup", icon=":material/add:"):
-        c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
-        c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
-                     index=None, placeholder="Away", key="c_away")
-        c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
-                     index=None, placeholder="Home", key="c_home")
-        c3.button("Load matchup", on_click=load_custom, width="stretch")
-        if st.session_state.get('c_err'):
-            st.error(st.session_state.pop('c_err'))
-
     sel = st.session_state.get('g_sel')
     if sel and sel[2] != gdate.isoformat():   # picked on another date
         close_game()
         sel = None
     if not sel:
-        st.caption("Open a game above, or add a custom matchup, to check who's playing, add betting "
-                   "lines and see the full breakdown.")
+        slate_panel(gdate)
+        with st.expander("Add a custom matchup", icon=":material/add:"):
+            c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+            c1.selectbox("Away team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                         index=None, placeholder="Away", key="c_away")
+            c2.selectbox("Home team", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                         index=None, placeholder="Home", key="c_home")
+            c3.button("Load matchup", on_click=load_custom, width="stretch")
+            if st.session_state.get('c_err'):
+                st.error(st.session_state.pop('c_err'))
     else:
+        # an opened game takes the list's place, so it's obvious something opened
         away, home, _ = sel
-
-        st.divider()
         h1, h2 = st.columns([4, 1], vertical_alignment="center")
         with h1:
             ui.show(f'<div class="title-row">{ui.team(away, 34, teams.get(away, away))}<span class="s">at</span>'
                     f'{ui.team(home, 34, teams.get(home, home))}</div>')
-        h2.button("Close", icon=":material/close:", on_click=close_game, width="stretch")
+        h2.button("All games", icon=":material/arrow_back:", on_click=close_game, width="stretch")
+        pred_area = st.container()   # the prediction sits above the checklists; filled in below
         lineups = lineup_inputs(away, home, gdate.isoformat())
         if st.session_state.pop('g_auto', False):  # just opened: show its prediction
             run_game(home, away, gdate.isoformat(), lineups=lineups)
@@ -684,24 +782,30 @@ with tab_game:
         if res:
             pred, evals, stale, calibrated, gd, book = res
             h, a = pred['home'], pred['away']
-            st.write("")
-            ui.matchup(a, h, team_options(), pred, gd)
-            notes = [f"Projected pace {pred['pace']:.1f} possessions."]
-            adj = adjustment_text(pred)
-            if adj:
-                notes.append(f"Adjustments to the {h} margin: {adj}")
-            if not calibrated:
-                notes.append("Score spreads use default values until the first data update calibrates them.")
-            st.caption(" ".join(notes))
-            try:
-                why = explain_game(game_context(gd, version), pred, **pred.get('lineups', {}))
-                with st.container(border=True):
-                    st.markdown(f"**Why:** {why['summary']}")
-                    st.markdown("\n".join(f"- {d}" for d in why['details']))
-            except Exception:  # the explanation is a nice-to-have; the numbers above still stand
-                pass
-            if stale:
-                st.warning(stale)
+            with pred_area:
+                ui.matchup(a, h, team_options(), pred, gd)
+                notes = [f"Projected pace {pred['pace']:.1f} possessions."]
+                adj = adjustment_text(pred)
+                if adj:
+                    notes.append(f"Adjustments to the {h} margin: {adj}")
+                if not calibrated:
+                    notes.append("Score spreads use default values until the first data update calibrates them.")
+                st.caption(" ".join(notes))
+                conn = db()
+                try:
+                    track_button(pick_id(conn, gd, h, a), pick_label(pred), "track_pick",
+                                 lambda: track_pick(conn, gd, pred), lambda i: untrack_game_bet(conn, i))
+                finally:
+                    conn.close()
+                try:
+                    why = explain_game(game_context(gd, version), pred, **pred.get('lineups', {}))
+                    with st.container(border=True):
+                        st.markdown(f"**Why:** {why['summary']}")
+                        st.markdown("\n".join(f"- {d}" for d in why['details']))
+                except Exception:  # the explanation is a nice-to-have; the numbers above still stand
+                    pass
+                if stale:
+                    st.warning(stale)
 
             names = {'SPREAD': (h, a), 'TOTAL': ('Over', 'Under'), 'MONEYLINE': (h, a)}
             for col, e in zip(st.columns(max(len(evals), 1)), evals):
@@ -864,10 +968,160 @@ def tracked_metrics(s):
                 help=f"Model's claimed average EV on these: {rec['claimed_ev']:+.1%}" if rec else None)
 
 
+def add_tracked_section():
+    """Track a game or prop straight from the Tracked bets tab, without opening it first."""
+    kind = st.segmented_control("Add", ["Game", "Prop"], default="Game", key="add_kind",
+                                label_visibility="collapsed") or "Game"
+    if kind == "Game":
+        c1, c2 = st.columns([1, 3])
+        d = c1.date_input("Date", value=date.today(), key="add_gdate")
+        games, _, _ = slate(d.isoformat())
+        if games.empty:
+            c2.selectbox("Game", options=[], placeholder=f"No games on {day_label(d)}", key="add_no_game")
+            return
+        gi = c2.selectbox("Game", options=range(len(games)), key="add_game", format_func=lambda i: " · ".join(
+            x for x in (f"{games.away[i]} @ {games.home[i]}", games.status[i], games.label[i]) if x))
+        if gi is None or gi >= len(games):   # e.g. a pick from a date with more games
+            return
+        g = games.iloc[gi]
+        market = st.radio("What to track", ["Model's pick (no line)", "Spread", "Total", "Moneyline"],
+                          horizontal=True, key="add_market")
+        line, odds = None, (-110, -110)
+        if market != "Model's pick (no line)":
+            c1, c2, c3 = st.columns(3)
+            if market != "Moneyline":
+                line = c1.number_input(f"{g.home} spread" if market == "Spread" else "Total points",
+                                       value=None, step=0.5, key="add_line",
+                                       placeholder="e.g. -5.5" if market == "Spread" else "e.g. 224.5")
+            a_lbl, b_lbl = (("Over odds", "Under odds") if market == "Total"
+                            else (f"{g.home} odds", f"{g.away} odds"))
+            odds = (c2.number_input(a_lbl, value=-110 if market != "Moneyline" else None, step=5, key="add_oa"),
+                    c3.number_input(b_lbl, value=-110 if market != "Moneyline" else None, step=5, key="add_ob"))
+        if st.button("Track", type="primary", icon=":material/bookmark_add:", key="add_game_go"):
+            if market in ("Spread", "Total") and line is None:
+                return st.error("Enter the line.")
+            if None in odds:
+                return st.error("Enter both prices.")
+            if bad_odds(odds):
+                return st.error(bad_odds(odds)[0])
+            try:
+                ctx = game_context(d.isoformat(), version)
+                pred = ctx.evaluate(g.home, g.away, line if market == "Spread" else None,
+                                    line if market == "Total" else None)
+                odds = tuple(int(o) for o in odds)
+                evals = evaluate_markets(pred, *((line, odds) if market == "Spread" else (None, None)),
+                                         *((line, odds) if market == "Total" else (None, None)),
+                                         odds if market == "Moneyline" else None, min_ev)
+            except Exception as e:
+                return st.error(f"{type(e).__name__}: {e}")
+            conn = db()
+            try:
+                if market == "Model's pick (no line)":
+                    track_pick(conn, ctx.game_date, pred)
+                    msg = pick_label(pred)
+                else:
+                    log_game_evals(conn, ctx.game_date, pred, evals, tracked=True)
+                    msg = f"{g.away} @ {g.home} {market.lower()}"
+            finally:
+                conn.close()
+            st.session_state['toast'] = f"Tracking {msg}"
+            st.rerun()
+    else:
+        players = player_options(version)
+        teams = team_options()
+        with st.form("add_prop"):
+            c1, c2, c3 = st.columns([2.2, 1.3, 1])
+            pid = c1.selectbox("Player", options=list(players), format_func=players.get, index=None,
+                               placeholder="Type a name...", key="add_player")
+            stat = c2.selectbox("Stat", options=list(STAT_LABELS), key="add_stat",
+                                format_func=lambda s: f"{STAT_LABELS[s]} ({s})")
+            line = c3.number_input("Line", min_value=0.0, value=None, step=0.5, placeholder="e.g. 24.5",
+                                   key="add_pline")
+            c1, c2, c3, c4 = st.columns([1, 1, 1.6, 1.2])
+            over = c1.number_input("Over odds", value=-110, step=5, key="add_over")
+            under = c2.number_input("Under odds", value=-110, step=5, key="add_under")
+            opp = c3.selectbox("Opponent", options=list(teams), format_func=lambda a: f"{teams[a]} ({a})",
+                               index=None, placeholder="Optional", key="add_opp")
+            d = c4.date_input("Game date", value=date.today(), key="add_pdate")
+            go = st.form_submit_button("Track", type="primary", icon=":material/bookmark_add:")
+        if go:
+            if pid is None or line is None:
+                return st.error("Pick a player and enter a line.")
+            if bad_odds((over, under)):
+                return st.error(bad_odds((over, under))[0])
+            try:
+                r = evaluate_prop(prop_context(d.isoformat(), version), pid, stat, float(line), int(over),
+                                  int(under), opponent=opp, min_ev=min_ev)
+            except Exception as e:
+                return st.error(f"{type(e).__name__}: {e}")
+            if r is None:
+                return st.error("Not enough recent games to project this player.")
+            conn = db()
+            try:
+                log_prop(conn, r, tracked=True)
+            finally:
+                conn.close()
+            st.session_state['toast'] = f"Tracking {players[pid]} {stat} {line:g}"
+            st.rerun()
+
+
+TABLE_CONFIG = {
+    'Date': st.column_config.TextColumn(width="small"),
+    'Away logo': st.column_config.ImageColumn("", width="small"),
+    'Home logo': st.column_config.ImageColumn("", width="small"),
+    'Projection': st.column_config.NumberColumn("Proj", format="%.1f"),
+    'Model %': st.column_config.NumberColumn("Model", format="%.0f%%"),
+    'EV': st.column_config.NumberColumn(format="%+.1f%%"),
+    'Actual': st.column_config.NumberColumn(format="%g"),
+    'Profit (u)': st.column_config.NumberColumn("Units", format="%+.2f"),
+}
+
+
+def tracked_table(df, kind):
+    """Tracked entries; select rows to stop tracking them or delete them."""
+    view = df.drop(columns='id')
+    view[['Model %', 'EV']] = view[['Model %', 'EV']].astype(float) * 100
+    view['vs' if kind == 'props' else 'Final'] = view['vs' if kind == 'props' else 'Final'].replace('', None)
+    if kind == 'games':
+        view.insert(1, 'Away logo', df['Away'].map(ui.logo_uri))
+        view.insert(3, 'Home logo', df['Home'].map(ui.logo_uri))
+    ver = st.session_state.get('trk_ver', 0)   # bumped after a change so the old selection is dropped
+    event = st.dataframe(view, hide_index=True, column_config=TABLE_CONFIG, on_select="rerun", placeholder="–",
+                         selection_mode="multi-row", key=f"trk_{kind}_{ver}")
+    ids = [int(df['id'].iloc[i]) for i in event.selection.rows]
+    if not ids:
+        st.caption("Select rows (the box at the left of each row) to remove them.")
+        return
+    n = f"{len(ids)} entr{'y' if len(ids) == 1 else 'ies'}"
+    untrack, delete = (untrack_prop, delete_prop) if kind == 'props' else (untrack_game_bet, delete_game_bet)
+    c1, c2, _ = st.columns([1.2, 1.2, 3])
+    if c1.button(f"Remove {n}", key=f"rm_{kind}", icon=":material/bookmark_remove:", width="stretch",
+                 help="Stop tracking them. Their evaluations stay saved for the calibration check."):
+        done = untrack
+    else:
+        done = None
+        with c2.popover(f"Delete {n}", icon=":material/delete:", width="stretch"):
+            st.caption("Deletes them for good, including their calibration data.")
+            if st.button("Yes, delete", key=f"del_{kind}", type="primary"):
+                done = delete
+    if done:
+        conn = db()
+        try:
+            for i in ids:
+                done(conn, i)
+        finally:
+            conn.close()
+        st.session_state['trk_ver'] = ver + 1
+        st.session_state['toast'] = f"{'Removed' if done is untrack else 'Deleted'} {n}"
+        st.rerun()
+
+
 with tab_results:
+    with st.expander("Add a game or prop to track", icon=":material/add:"):
+        add_tracked_section()
     summary_area = st.container()
     st.write("")
-    with st.expander("Enter a result by hand, stop tracking, or delete", icon=":material/edit_note:"):
+    with st.expander("Enter or fix a result by hand", icon=":material/edit_note:"):
         manual_settle_section()
     conn = db()
     try:
@@ -879,8 +1133,9 @@ with tab_results:
 
     with summary_area:
         c1, c2 = st.columns([4, 1], vertical_alignment="center")
-        c1.caption("Press **Track this** on any prop or game line. Once the game is over, the result fills in "
-                   "here by itself when the app pulls new games (on opening it, or with **Update data**).")
+        c1.caption("Press **Track pick** on a game, **Track this** on any prop or line, or add one above. Once "
+                   "the game is over, the result fills in here by itself when the app pulls new games (on "
+                   "opening it, or with **Update data**).")
         if c2.button("Check for results", width="stretch", key="check_results", icon=":material/refresh:"):
             with st.status("Pulling the latest games...", expanded=True) as status:
                 ok = pull_data()
@@ -890,14 +1145,14 @@ with tab_results:
         st.segmented_control("Show", ["All", "Pending", "Finished"], default="All", key="track_show",
                              label_visibility="collapsed")
 
-        for title, summ, df, table, noun in (("Props", ps, props_df, ui.props_table, "props"),
-                                            ("Game lines", gs, games_df, ui.games_table, "game lines")):
+        for title, summ, df, kind, noun in (("Props", ps, props_df, 'props', "props"),
+                                           ("Games", gs, games_df, 'games', "games")):
             st.subheader(title)
             tracked_metrics(summ)
             if df.empty:
                 st.caption("Nothing tracked yet." if show == 'All' else f"No {show.lower()} {noun}.")
             else:
-                table(df)
+                tracked_table(df, kind)
 
         cal = ps.get('calibration')
         if cal:

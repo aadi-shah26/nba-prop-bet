@@ -39,21 +39,25 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 from scipy import stats as sps
+from scipy.optimize import minimize_scalar
 
 from db import connect, season_for_date, team_abbr, to_date
 
-DEFAULT_SD_MARGIN = 14.0   # walk-forward residual SDs; recalibrated from your data
+DEFAULT_SD_MARGIN = 12.7   # margin SD fit to win/loss (see fit_win_sd); recalibrated from your data
 DEFAULT_SD_TOTAL = 18.6
 DISAGREE_WARN = 0.10
+WINNER = 'WINNER'          # game_log market for a tracked winner pick with no betting line
 
 
 @dataclass
 class GameParams:
-    # Tuned walk-forward on 2021-22/2022-23, confirmed on 2023-24: margins are best predicted
-    # by slower-moving ratings, totals by faster ones (scoring environment drifts in-season).
-    half_life_margin: float = 20.0   # games per team
+    # Margins are best predicted by slower-moving ratings, totals by faster ones (scoring
+    # environment drifts in-season). Re-tuned walk-forward on 2021-22 to 2025-26 (coefficients
+    # fit on the season before each one scored): half-life 30 / last season 0.4 beat 20 / 0.3
+    # on Brier in 4 of 5 seasons, early season included.
+    half_life_margin: float = 30.0   # games per team
     half_life_total: float = 10.0
-    prev_season_weight: float = 0.3
+    prev_season_weight: float = 0.4
     lookback_seasons: int = 2
     prior_games: float = 6.0         # pseudo-games of league average (shrinkage)
     adjust_iters: int = 25
@@ -360,6 +364,16 @@ def fit_coefs(df):
     return coefs, float((y - pred).std())
 
 
+def fit_win_sd(margin, home_won):
+    """SD of the normal margin distribution that best predicts who wins (max likelihood).
+    Margins are fat-tailed (blowouts), so the plain residual SD (~13.8) is too wide near the
+    middle where win and spread probabilities are decided; this fits ~12.7, which also matches
+    how often teams beat the projection by 1.5-12.5 points."""
+    y = np.asarray(home_won, dtype=float)
+    nll = lambda sd: -np.mean(y * sps.norm.logcdf(margin / sd) + (1 - y) * sps.norm.logcdf(-margin / sd))
+    return float(minimize_scalar(nll, bounds=(8.0, 20.0), method='bounded').x)
+
+
 def calibrate(conn, params=None, min_games=600):
     """Fit the margin adjustment coefficients and the margin/total residual SDs from the most
     recent walk-forward predictions and store them in model_params.
@@ -377,7 +391,10 @@ def calibrate(conn, params=None, min_games=600):
     df = df.sort_values('game_date').tail(1500)
     if len(df) < min_games:
         return None
-    coefs, sd_m = fit_coefs(df)
+    coefs, _ = fit_coefs(df)
+    margin = df[['rating_margin', 'b2b_diff', 'lineup_diff']].to_numpy(dtype=float) @ \
+        np.array([coefs['scale'], coefs['b2b'], coefs['lineup']])
+    sd_m = fit_win_sd(margin, df['act_margin'].to_numpy(dtype=float) > 0)
     sd_t = float((df['act_total'] - df['pred_total']).std())
     now = datetime.now(timezone.utc).isoformat(timespec='seconds')
     vals = [('game_sd_margin', sd_m), ('game_sd_total', sd_t)] + \
@@ -614,10 +631,35 @@ def game_log_id(conn, game_date, pred, e, book=None, tracked_only=False):
 
 
 def untrack_game_bet(conn, row_id):
-    """Stop following one game market. The evaluation stays as calibration data."""
-    n = conn.execute("UPDATE game_log SET tracked = 0 WHERE id = ?", (row_id,)).rowcount
+    """Stop following one game market. The evaluation stays as calibration data (a winner pick
+    has no market to calibrate against, so it's removed)."""
+    n = conn.execute("DELETE FROM game_log WHERE id = ? AND market = ?", (row_id, WINNER)).rowcount
+    n += conn.execute("UPDATE game_log SET tracked = 0 WHERE id = ?", (row_id,)).rowcount
     conn.commit()
     return n > 0
+
+
+def track_pick(conn, game_date, pred):
+    """Track the model's predicted winner, with no betting line: it's judged only on whether
+    that team wins. Stored as a WINNER row with pick 'PASS', so it settles like a moneyline
+    lean and never counts toward profit. Replaces an earlier pick for the same game."""
+    p = float(pred['p_home_win'])
+    conn.execute("DELETE FROM game_log WHERE market = ? AND game_date = ? AND home = ? AND away = ?",
+                 (WINNER, game_date, pred['home'], pred['away']))
+    cur = conn.execute("""INSERT INTO game_log (logged_at, game_date, home, away, market, line, odds_a,
+                          odds_b, book, pred_home, pred_away, p_a, p_b, fair_a, ev_a, ev_b, pick, tracked)
+                          VALUES (?,?,?,?,?,NULL,0,0,'',?,?,?,?,0.5,0,0,'PASS',1)""",
+                       (datetime.now(timezone.utc).isoformat(timespec='seconds'), game_date, pred['home'],
+                        pred['away'], WINNER, float(pred['pred_home']), float(pred['pred_away']), p, 1 - p))
+    conn.commit()
+    return cur.lastrowid
+
+
+def pick_id(conn, game_date, home, away):
+    """Row id of the tracked winner pick for a game, or None."""
+    row = conn.execute("SELECT id FROM game_log WHERE market = ? AND tracked = 1 AND game_date = ? "
+                       "AND home = ? AND away = ?", (WINNER, game_date, home, away)).fetchone()
+    return row[0] if row else None
 
 
 def game_result(market, line, pick, home_pts, away_pts, home, away):
@@ -674,6 +716,13 @@ def settle_game_manual(conn, game_date, home, away, home_pts, away_pts):
         _write_game_result(conn, row_id, market, line, pick, int(home_pts), int(away_pts), home, away, now)
     conn.commit()
     return len(rows)
+
+
+def delete_game_bet(conn, row_id):
+    """Remove one logged game market. Returns True if a row was deleted."""
+    n = conn.execute("DELETE FROM game_log WHERE id = ?", (row_id,)).rowcount
+    conn.commit()
+    return n > 0
 
 
 def delete_game_bets(conn, game_date, home, away):

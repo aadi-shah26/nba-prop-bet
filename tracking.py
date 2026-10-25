@@ -46,7 +46,7 @@ def _status(outcome, settled, void):
 
 
 def _profit(is_bet, outcome, odds):
-    dec = odds.map(american_to_decimal)
+    dec = odds[is_bet].map(american_to_decimal).reindex(odds.index)   # winner picks have no odds
     return pd.Series(np.where(~is_bet | outcome.isna(), np.nan,
                               np.where(outcome > 0, dec - 1, np.where(outcome < 0, -1.0, 0.0))),
                      index=outcome.index)
@@ -170,11 +170,11 @@ def tracked_games(conn, show='All', today=None):
         'Date': r.game_date,
         'Away': r.away,
         'Home': r.home,
-        'Bet': f"{_game_side_label(r)} ({int(r.odds):+d})",
-        'Type': 'Bet' if r.is_bet else 'Lean',
+        'Bet': _game_side_label(r) + ('' if r.market == 'WINNER' else f" ({int(r.odds):+d})"),
+        'Type': 'Pick' if r.market == 'WINNER' else 'Bet' if r.is_bet else 'Lean',
         'Predicted': f"{r.pred_away:.1f} – {r.pred_home:.1f}",
         'Model %': r.p_side,
-        'EV': r.ev,
+        'EV': np.nan if r.market == 'WINNER' else r.ev,
         'Final': f"{r.away_pts:.0f} – {r.home_pts:.0f}" if pd.notna(r.home_pts) else '',
         'Result': _result_text(r, today),
         'Profit (u)': r.profit,

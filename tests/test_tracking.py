@@ -1,8 +1,11 @@
 import math
 
+import pandas as pd
+
 from bet_signals import evaluate_prop, log_prop, prop_log_id, settle_props, untrack_prop
 from db import connect, init_db
-from game_model import GameContext, evaluate_markets, game_log_id, log_game_evals, settle_games, untrack_game_bet
+from game_model import (GameContext, evaluate_markets, game_log_id, log_game_evals, pick_id, settle_games,
+                        track_pick, untrack_game_bet)
 from projection_model import PropContext
 from tracking import (HIT, MISS, PENDING, VOID, game_summary, prop_summary, tracked_games,
                       tracked_props)
@@ -85,6 +88,26 @@ def test_game_tracking(league_conn):
     assert s['accuracy']['hits'] == 1 and s['record']['losses'] == 1
     assert untrack_game_bet(league_conn, game_log_id(league_conn, d, pred, tot))
     assert game_summary(league_conn)['tracked'] == 1
+
+
+def test_winner_pick(league_conn):
+    d, home, away = _game(league_conn)
+    hp, ap = league_conn.execute("""SELECT h.pts, a.pts FROM team_games h JOIN team_games a
+        ON a.game_id=h.game_id AND a.team=h.opponent WHERE h.game_date=? AND h.home=1""", (d,)).fetchone()
+    pred = GameContext(league_conn, d).evaluate(home, away)
+    first = track_pick(league_conn, d, pred)
+    row = track_pick(league_conn, d, pred)                           # re-tracking replaces, not duplicates
+    assert pick_id(league_conn, d, home, away) == row != first
+    settle_games(league_conn)
+    t = tracked_games(league_conn).iloc[0]
+    fav = home if pred['p_home_win'] >= 0.5 else away
+    won = home if hp > ap else away
+    assert t['Bet'] == f"{fav} to win" and t['Type'] == 'Pick' and pd.isna(t['EV'])
+    assert t['Result'] == (HIT if fav == won else MISS) and pd.isna(t['Profit (u)'])
+    s = game_summary(league_conn)
+    assert s['accuracy']['hits' if fav == won else 'misses'] == 1 and s['record'] is None   # not a bet
+    assert untrack_game_bet(league_conn, row)
+    assert league_conn.execute("SELECT COUNT(*) FROM game_log").fetchone()[0] == 0  # no market to keep
 
 
 def test_empty_tables(conn):
