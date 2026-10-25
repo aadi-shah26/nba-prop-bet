@@ -101,7 +101,7 @@ def test_manual_settle_and_delete_in_app(app_db):
     pid = app_db.execute("SELECT player_id FROM player_games WHERE team=? ORDER BY minutes DESC",
                          (home,)).fetchone()[0]
     r = evaluate_prop(PropContext(app_db, d), pid, 'PTS', 20.5, -110, -110, min_ev=-1.0)
-    log_prop(app_db, r)
+    log_prop(app_db, r, tracked=True)
     row_id = app_db.execute("SELECT id FROM prop_log").fetchone()[0]
 
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
@@ -163,8 +163,8 @@ def test_odds_api_import_flow(app_db, monkeypatch):
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
     assert not at.exception
 
+    assert calls and calls[0].endswith('/events')        # today's games load by themselves
     at.date_input(key='oa_pdate').set_value(date.fromisoformat(d))
-    _w(at.button, 'Load games (free)').click()
     at.run()
     _w(at.button, 'Load props (1 credit)').click()
     at.run()
@@ -201,3 +201,49 @@ def test_game_lineup_checklist(app_db):
     at.run()
     assert not at.exception and not at.error
     assert any('lineups -' in c.value for c in at.caption)
+
+
+def test_track_this_and_tracked_tab(app_db):
+    d, home, away = _game_date(app_db)
+    pid = app_db.execute("SELECT player_id FROM player_games WHERE team=? ORDER BY minutes DESC",
+                         (home,)).fetchone()[0]
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    _w(at.selectbox, 'Player').set_value(pid)
+    _w(at.number_input, 'Line').set_value(18.5)
+    at.date_input[0].set_value(date.fromisoformat(d))
+    _w(at.button, 'Evaluate prop').click()
+    at.run()
+    assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (0,)   # saved, not tracked
+    at.button(key='track_prop').click()
+    at.run()
+    assert not at.exception
+    assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (1,)
+    assert any('Tracked' in s.value for s in at.success)
+    table = next(t.value for t in at.dataframe if 'Player' in t.value)   # Tracked bets tab
+    assert list(table['Player']) == [f"{home} Player0"] and table['Result'][0] == '⌛ Awaiting result'
+    at.button(key='untrack_prop').click()
+    at.run()
+    assert app_db.execute("SELECT tracked FROM prop_log").fetchone() == (0,)
+
+
+def test_auto_update_on_open(app_db, monkeypatch):
+    import daily_update
+    calls = []
+
+    def fake_update(conn, log=print, retries=4):
+        calls.append(retries)
+    monkeypatch.setenv('NBA_AUTO_UPDATE', '1')
+    monkeypatch.setattr(daily_update, 'update', fake_update)
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception and calls == [2]
+    at.run()                                                        # reruns in the same session: no
+    st_testing.AppTest.from_file(APP, default_timeout=120).run()    # new session within 30 min: no
+    assert calls == [2]
+    db.set_meta(app_db, 'last_update_attempt', '2000-01-01T00:00:00+00:00')
+
+    def offline(conn, log=print, retries=4):
+        raise ConnectionError("offline")
+    monkeypatch.setattr(daily_update, 'update', offline)
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception                                         # falls back to saved data
+    assert any('offline' in e.value for e in at.error)

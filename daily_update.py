@@ -9,16 +9,17 @@ Daily maintenance (run once a day after the previous night's games, or press
     python daily_update.py
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bet_signals import settle_props
-from db import connect, init_db, season_for_date, season_str
+from db import connect, init_db, season_for_date, season_str, set_meta
 from fetch_game_logs import ingest_season
 from game_model import calibrate, settle_games
 
 
-def update(conn, log=print):
-    """Refresh data, settle bets, recalibrate. Builds the last 3 seasons if the DB is empty."""
+def update(conn, log=print, retries=4):
+    """Refresh data, settle bets, recalibrate. Builds the last 3 seasons if the DB is empty.
+    retries: attempts per stats.nba.com request (the app's automatic update uses fewer)."""
     init_db(conn)
     season = season_for_date(None)
     last = conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
@@ -31,7 +32,7 @@ def update(conn, log=print):
         seasons = list(range(min(season_for_date(last), season), season + 1))
     for s in seasons:
         log(f"🔄 Refreshing {season_str(s)}")
-        ingest_season(conn, s, log=log)
+        ingest_season(conn, s, log=log, retries=retries)
 
     n_p, n_g = settle_props(conn), settle_games(conn)
     log(f"🧾 Settled {n_p} props, {n_g} game bets")
@@ -42,6 +43,7 @@ def update(conn, log=print):
         log(f"📐 Game model SDs: margin {cal[0]:.2f}, total {cal[1]:.2f} (from {cal[2]} games); "
             f"margin scale {c['scale']:.2f}, back-to-back {c['b2b']:.1f} pts, lineup {c['lineup']:.3f}")
     last = conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
+    set_meta(conn, 'last_update', datetime.now(timezone.utc).isoformat(timespec='seconds'))
     log(f"📊 Latest game in database: {last}")
     return last
 

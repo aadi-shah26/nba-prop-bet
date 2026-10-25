@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS prop_log (
     actual       REAL,                   -- filled in by settle
     result       TEXT,                   -- 'WIN' | 'LOSS' | 'PUSH' | 'DNP' (pick side; for PASS: which side hit)
     settled_at   TEXT,
+    tracked      INTEGER NOT NULL DEFAULT 0,  -- 1 = you pressed "Track this"; 0 = only kept for calibration
     UNIQUE (game_date, player_id, stat, line, over_odds, under_odds, book)
 );
 
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS game_log (
     away_pts    INTEGER,
     result      TEXT,
     settled_at  TEXT,
+    tracked     INTEGER NOT NULL DEFAULT 0,
     UNIQUE (game_date, home, away, market, line, odds_a, odds_b, book)
 );
 
@@ -113,6 +115,12 @@ CREATE TABLE IF NOT EXISTS model_params (
     key        TEXT PRIMARY KEY,
     value      REAL NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- App bookkeeping (e.g. when the data was last refreshed), as text.
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- game_log's UNIQUE constraint can't dedupe moneylines (line IS NULL) or rows without a book,

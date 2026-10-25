@@ -6,23 +6,26 @@ NBA betting model — local web app.
 Pick a player or game, type the line and the prices, get OVER / UNDER / PASS with the
 numbers behind it. Optionally, with an ODDS_API_KEY set, lines can be imported from The Odds
 API instead of typed. Evaluations are saved to your log and settled automatically when you
-press "Update data".
+press "Update data". Opening the app pulls the latest games by itself (at most every
+AUTO_UPDATE_MINUTES), so the data and your tracked bets are current without pressing anything.
+Press "📌 Track this" on any evaluation to follow it in the Tracked bets tab.
 """
 
-from datetime import date
+import os
+from datetime import date, datetime, timedelta, timezone
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from bet_signals import delete_prop, evaluate_prop, log_prop, settle_prop_manual
+from bet_signals import delete_prop, evaluate_prop, log_prop, prop_log_id, settle_prop_manual, untrack_prop
 import odds_fetcher
-from db import DB_PATH, connect, init_db, recent_players, season_for_date
-from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate_markets, log_game_evals,
-                        settle_game_manual, stale_warning)
+from db import DB_PATH, connect, get_meta, init_db, recent_players, season_for_date, set_meta
+from game_model import (GameContext, adjustment_text, delete_game_bets, evaluate_markets, game_log_id,
+                        log_game_evals, settle_game_manual, stale_warning, untrack_game_bet)
 from projection_model import PropContext, count_distribution
-from tracking import game_summary, prop_summary, recent_games, recent_props
+from tracking import game_summary, prop_summary, tracked_games, tracked_props
 
 st.set_page_config(page_title="NBA Betting Model", page_icon="🏀", layout="wide")
 
@@ -31,6 +34,7 @@ STAT_LABELS = {
     'PRA': 'Pts + Reb + Ast', 'PR': 'Pts + Reb', 'PA': 'Pts + Ast', 'RA': 'Reb + Ast',
     'STL': 'Steals', 'BLK': 'Blocks', 'SB': 'Steals + Blocks', 'TOV': 'Turnovers',
 }
+AUTO_UPDATE_MINUTES = 30    # opening the app pulls new games at most this often
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +120,7 @@ def run_prop(player_id, stat, line, over_odds, under_odds, opponent, minutes, ga
     if r is None:
         st.error("Not enough recent games to project this player.")
         return
-    st.session_state['prop_result'] = r
+    st.session_state['prop_result'] = {**r, 'book': book}
     if save:
         conn = db()
         log_prop(conn, r, book=book)
@@ -133,7 +137,7 @@ def run_game(home, away, game_date, spread=None, spread_odds=None, total=None, t
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
         return
-    st.session_state['game_result'] = (pred, evals, stale_warning(ctx), ctx.calibrated, ctx.game_date)
+    st.session_state['game_result'] = (pred, evals, stale_warning(ctx), ctx.calibrated, ctx.game_date, book)
     if save and evals:
         conn = db()
         log_game_evals(conn, ctx.game_date, pred, evals, book=book)
@@ -176,6 +180,60 @@ def lineup_inputs(away, home, game_date):
     return res
 
 
+def track_button(tracked_id, label, key, on_track, on_untrack):
+    """"📌 Track this" for an evaluation, or "Tracked" with an undo once it is."""
+    if tracked_id:
+        c1, c2 = st.columns([5, 1])
+        c1.success("📌 Tracked: it settles by itself after the game. See **📒 Tracked bets**.")
+        if c2.button("Untrack", key=f"un{key}", width="stretch"):
+            on_untrack(tracked_id)
+            st.rerun()
+    elif st.button(f"📌 Track this: {label}", key=key, type="primary"):
+        on_track()
+        st.rerun()
+
+
+def pull_data(retries=4):
+    """Download the latest box scores, settle bets, recalibrate. Returns True on success."""
+    from daily_update import update
+    conn = db()
+    try:
+        update(conn, log=st.write, retries=retries)
+    except Exception as e:  # network failures etc. — show, don't crash the app
+        st.error(f"{type(e).__name__}: {e}")
+        return False
+    finally:
+        conn.close()
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    return True
+
+
+def auto_update():
+    """When the app opens, pull the latest games (which also settles tracked bets), so the data
+    reaches today without pressing Update data. Once per browser session, and not again within
+    AUTO_UPDATE_MINUTES of the last try (another tab, a refresh). NBA_AUTO_UPDATE=0 turns it off."""
+    if st.session_state.get('auto_update_done') or os.getenv('NBA_AUTO_UPDATE', '1') == '0':
+        return
+    st.session_state['auto_update_done'] = True
+    conn = db()
+    try:
+        last = get_meta(conn, 'last_update_attempt')
+        now = datetime.now(timezone.utc)
+        if last and now - datetime.fromisoformat(last) < timedelta(minutes=AUTO_UPDATE_MINUTES):
+            return
+        # recorded before trying, so being offline doesn't stall every page open
+        set_meta(conn, 'last_update_attempt', now.isoformat(timespec='seconds'))
+    finally:
+        conn.close()
+    with st.status("Pulling the latest games from stats.nba.com...", expanded=False) as status:
+        if pull_data(retries=2):
+            status.update(label="Data is up to date", state="complete")
+        else:
+            status.update(label="Couldn't pull new games, so the saved data is in use. Press 🔄 Update data "
+                                "to try again.", state="error")
+
+
 def _api_call(fn, *args):
     """Call The Odds API, showing failures and credit usage instead of crashing the app."""
     try:
@@ -191,6 +249,7 @@ def _api_call(fn, *args):
 # Sidebar: data status + settings
 # ---------------------------------------------------------------------------
 
+auto_update()
 version = data_version()
 last_game, n_player_games, _ = version
 
@@ -202,29 +261,29 @@ with st.sidebar:
     else:
         st.warning("No data yet. Press **Update data** to download the last 3 seasons (~1 minute).")
 
+    conn = db()
+    refreshed = get_meta(conn, 'last_update')
+    conn.close()
+    if refreshed:
+        local = datetime.fromisoformat(refreshed).astimezone()
+        st.caption(f"Last pulled {local:%b %d, %I:%M %p}. Opening the app pulls new games automatically.")
     if st.button("🔄 Update data", width="stretch",
-                 help="Downloads the latest box scores from stats.nba.com, settles your logged bets "
-                      "and recalibrates the game model. Do this once a day."):
-        from daily_update import update
+                 help="Downloads the latest box scores from stats.nba.com, settles your tracked bets "
+                      "and recalibrates the game model. The app also does this by itself when you open it."):
         with st.status("Updating...", expanded=True) as status:
-            try:
-                conn = db()
-                update(conn, log=st.write)
-                conn.close()
-                status.update(label="Data updated", state="complete")
-                st.cache_resource.clear()
-                st.cache_data.clear()
-            except Exception as e:  # network failures etc. — show, don't crash the app
-                status.update(label="Update failed", state="error")
-                st.error(f"{type(e).__name__}: {e}")
+            ok = pull_data()
+            status.update(label="Data updated" if ok else "Update failed", state="complete" if ok else "error")
+        if ok:
+            st.rerun()
 
     st.divider()
     min_ev = st.slider("Minimum EV to bet", 0.0, 10.0, 3.0, 0.5, format="%.1f%%",
                        help="Only recommend a side whose expected value per $1 is at least this. "
                             "3% is a sensible floor: model error eats thinner edges.") / 100
-    save = st.toggle("Save evaluations to my log", value=True,
-                     help="Logged bets are settled automatically on the next data update, "
-                          "so the Results tab can show whether the model actually beats the market.")
+    save = st.toggle("Record every evaluation for calibration", value=True,
+                     help="Quietly saves everything you evaluate (tracked or not) so the Tracked bets tab can "
+                          "measure the model against the market without the bias of only counting what you "
+                          "chose to track. Your tracked list only shows what you press 📌 Track this on.")
     st.caption(f"Database: `{DB_PATH.name}`")
 
 if not n_player_games:
@@ -232,7 +291,7 @@ if not n_player_games:
     st.info("Press **🔄 Update data** in the sidebar to get started.")
     st.stop()
 
-tab_prop, tab_game, tab_results = st.tabs(["🎯 Player prop", "🏀 Game", "📒 My results"])
+tab_prop, tab_game, tab_results = st.tabs(["🎯 Player prop", "🏀 Game", "📒 Tracked bets"])
 
 
 
@@ -249,11 +308,16 @@ def odds_api_prop_panel(players):
         markets = c3.multiselect("Markets", options=list(odds_fetcher.PROP_MARKETS),
                                  default=['player_points'], key="oa_pmarkets",
                                  format_func=lambda m: STAT_LABELS[odds_fetcher.PROP_MARKETS[m]])
-        if st.button("Load games (free)", key="oa_events"):
+        # the game list is free, so it loads by itself for the chosen date (today by default)
+        refresh = st.button("↻ Reload games (free)", key="oa_events")
+        if refresh or st.session_state.get('oa_event_date') != d.isoformat():
+            st.session_state['oa_event_date'] = d.isoformat()
+            st.session_state.pop('oa_prop_rows', None)
             ev = _api_call(odds_fetcher.fetch_events, d.isoformat())
-            if ev is not None:
+            if ev is None:
+                st.session_state.pop('oa_event_list', None)
+            else:
                 st.session_state['oa_event_list'] = ev
-                st.session_state.pop('oa_prop_rows', None)
         events = st.session_state.get('oa_event_list')
         if events is None:
             return
@@ -400,6 +464,16 @@ with tab_prop:
                        f"stake {r['kelly'] / 4:.1%} of bankroll (¼ Kelly)")
         for w in r['warnings']:
             st.warning(w)
+        side = r['pick'] if r['pick'] != 'PASS' else ('OVER' if r['p_over'] >= r['p_under'] else 'UNDER')
+        side_odds = r['over_odds'] if side == 'OVER' else r['under_odds']
+        conn = db()
+        try:
+            track_button(prop_log_id(conn, r, r['book'], tracked_only=True),
+                         f"{side} {r['line']:g} ({fmt_odds(side_odds)})"
+                         + (" · model lean, no edge" if r['pick'] == 'PASS' else ""), "track_prop",
+                         lambda: log_prop(conn, r, r['book'], tracked=True), lambda i: untrack_prop(conn, i))
+        finally:
+            conn.close()
 
         m = st.columns(4)
         m[0].metric("Projection", f"{r['mean']:.1f}", help=f"Standard deviation {r['sd']:.1f}")
@@ -488,7 +562,7 @@ with tab_game:
 
     res = st.session_state.get('game_result')
     if res:
-        pred, evals, stale, calibrated, gd = res
+        pred, evals, stale, calibrated, gd, book = res
         h, a = pred['home'], pred['away']
         st.subheader(f"{a} @ {h}  ·  {gd}")
         m = st.columns(4)
@@ -525,6 +599,18 @@ with tab_game:
                                f"stake {e['kelly'] / 4:.1%} of bankroll (¼ Kelly)")
                 if e['warning']:
                     st.warning(e['warning'])
+                lean = e['pick'] if e['pick'] != 'PASS' else ('A' if e['p_a'] >= e['p_b'] else 'B')
+                label = (f"{sa if lean == 'A' else sb}{' to win' if e['market'] == 'MONEYLINE' else ''} "
+                         f"({fmt_odds(e['odds_a'] if lean == 'A' else e['odds_b'])})"
+                         + (" · model lean, no edge" if e['pick'] == 'PASS' else ""))
+                conn = db()
+                try:
+                    track_button(game_log_id(conn, gd, pred, e, book, tracked_only=True), label,
+                                 f"track_{e['market']}",
+                                 lambda e=e: log_game_evals(conn, gd, pred, [e], book, tracked=True),
+                                 lambda i: untrack_game_bet(conn, i))
+                finally:
+                    conn.close()
                 st.dataframe(pd.DataFrame({
                     'Side': [sa, sb],
                     'Odds': [fmt_odds(e['odds_a']), fmt_odds(e['odds_b'])],
@@ -546,21 +632,20 @@ def manual_settle_section():
         st.session_state['settle_msg'] = msg
         st.rerun()
 
-    st.markdown("#### ✍️ Settle or delete manually")
     if 'settle_msg' in st.session_state:
         st.success(st.session_state.pop('settle_msg'))
-    st.caption("Enter the result yourself instead of waiting for **Update data**, correct one, or delete an "
-               "entry. Automatic settling never overwrites a result you entered.")
+    st.caption("Enter a result yourself instead of waiting for the data, correct one, stop tracking a bet, or "
+               "delete it. Automatic settling never overwrites a result you entered.")
     show_all = st.checkbox("Include already-settled entries (to correct or delete them)", key="settle_all")
     kind = st.radio("What", ["Prop", "Game"], horizontal=True, key="settle_kind", label_visibility="collapsed")
     conn = db()
     try:
         if kind == "Prop":
-            q = ("SELECT id, game_date, player_name, stat, line, pick, actual, result FROM prop_log "
-                 + ("" if show_all else "WHERE result IS NULL ") + "ORDER BY game_date DESC, id DESC")
+            q = ("SELECT id, game_date, player_name, stat, line, pick, actual, result FROM prop_log WHERE tracked = 1 "
+                 + ("" if show_all else "AND result IS NULL ") + "ORDER BY game_date DESC, id DESC")
             rows = {r[0]: r for r in conn.execute(q).fetchall()}
             if not rows:
-                st.info("No unsettled props." if not show_all else "No logged props yet.")
+                st.info("No pending tracked props." if not show_all else "No tracked props yet.")
                 return
 
             def label(i):
@@ -574,7 +659,7 @@ def manual_settle_section():
                 actual = c1.number_input("Actual stat", min_value=0.0, value=None, step=1.0,
                                          placeholder="e.g. 27")
                 action = c2.radio("Action", ["Use actual stat", "Didn't play (void)", "Clear result",
-                                             "Delete entry"], horizontal=True)
+                                             "Stop tracking", "Delete entry"], horizontal=True)
                 confirm = st.checkbox("Yes, delete it (only needed for Delete entry)")
                 if st.form_submit_button("Save", type="primary"):
                     if action == "Delete entry":
@@ -582,6 +667,9 @@ def manual_settle_section():
                             st.error("Tick “Yes, delete it” to confirm.")
                         elif delete_prop(conn, pid):
                             _done(f"Deleted: {rows[pid][2]} {rows[pid][3]} {rows[pid][4]:g} ({rows[pid][1]})")
+                    elif action == "Stop tracking":
+                        untrack_prop(conn, pid)
+                        _done(f"Stopped tracking: {rows[pid][2]} {rows[pid][3]} {rows[pid][4]:g} ({rows[pid][1]})")
                     elif action == "Use actual stat" and actual is None:
                         st.error("Enter the actual stat.")
                     else:
@@ -591,11 +679,11 @@ def manual_settle_section():
                                    f"{res or 'unsettled'}")
         else:
             q = ("SELECT game_date, home, away, COUNT(*), SUM(result IS NULL), MAX(away_pts), MAX(home_pts) "
-                 "FROM game_log GROUP BY game_date, home, away "
+                 "FROM game_log WHERE tracked = 1 GROUP BY game_date, home, away "
                  + ("" if show_all else "HAVING SUM(result IS NULL) > 0 ") + "ORDER BY game_date DESC")
             games = {f"{r[0]}|{r[1]}|{r[2]}": r for r in conn.execute(q).fetchall()}
             if not games:
-                st.info("No unsettled game bets." if not show_all else "No logged game bets yet.")
+                st.info("No pending tracked game bets." if not show_all else "No tracked game bets yet.")
                 return
 
             def glabel(k):
@@ -609,7 +697,8 @@ def manual_settle_section():
                 c1, c2 = st.columns(2)
                 ap = c1.number_input(f"{away} (away) final points", min_value=0, value=None, step=1)
                 hp = c2.number_input(f"{home} (home) final points", min_value=0, value=None, step=1)
-                action = st.radio("Action", ["Save final score", "Delete this game's bets"], horizontal=True)
+                action = st.radio("Action", ["Save final score", "Stop tracking this game",
+                                             "Delete this game's bets"], horizontal=True)
                 confirm = st.checkbox("Yes, delete them (only needed for Delete)")
                 if st.form_submit_button("Save", type="primary"):
                     if action == "Delete this game's bets":
@@ -618,6 +707,12 @@ def manual_settle_section():
                         else:
                             n = delete_game_bets(conn, d, home, away)
                             _done(f"Deleted {n} logged market(s) for {away} @ {home} ({d}).")
+                    elif action == "Stop tracking this game":
+                        ids = [i for (i,) in conn.execute("SELECT id FROM game_log WHERE tracked = 1 AND "
+                                                          "game_date=? AND home=? AND away=?", (d, home, away))]
+                        for i in ids:
+                            untrack_game_bet(conn, i)
+                        _done(f"Stopped tracking {len(ids)} market(s) for {away} @ {home} ({d}).")
                     elif ap is None or hp is None:
                         st.error("Enter both scores.")
                     else:
@@ -630,42 +725,69 @@ def manual_settle_section():
         conn.close()
 
 
+def tracked_metrics(s):
+    acc, rec = s['accuracy'], s['record']
+    c = st.columns(5)
+    c[0].metric("Tracked", s['tracked'], help=f"{s['pending']} waiting on the game")
+    c[1].metric("Model's side hit", f"{acc['rate']:.0%}" if acc['rate'] is not None else "—",
+                help=f"{acc['hits']} hit, {acc['misses']} missed (pushes and voids left out). "
+                     "Includes tracked passes, judged on the side the model leaned to.")
+    c[2].metric("Record (W-L-P)", f"{rec['wins']}-{rec['losses']}-{rec['pushes']}" if rec else "—",
+                help="Tracked bets only (a tracked PASS isn't a bet)")
+    c[3].metric("Profit", f"{rec['profit']:+.2f} u" if rec else "—", help="1 unit staked per bet")
+    c[4].metric("ROI", f"{rec['roi']:+.1%}" if rec else "—",
+                help=f"Model's claimed average EV on these: {rec['claimed_ev']:+.1%}" if rec else None)
+
+
+def tracked_table(df, empty):
+    if df.empty:
+        st.caption(empty)
+        return
+    df = df.assign(**{'Model %': df['Model %'] * 100, 'EV': df['EV'] * 100})
+    st.dataframe(df, hide_index=True, width="stretch", column_order=[c for c in df.columns if c != 'id'],
+                 column_config={'Model %': st.column_config.NumberColumn(format="%.0f%%",
+                                                                         help="Model's chance for this side"),
+                                'EV': st.column_config.NumberColumn(format="%+.1f%%"),
+                                'Profit (u)': st.column_config.NumberColumn(format="%+.2f")})
+
+
 with tab_results:
     summary_area = st.container()
     st.divider()
-    manual_settle_section()
+    with st.expander("✍️ Enter a result by hand, stop tracking, or delete"):
+        manual_settle_section()
     conn = db()
     try:
         ps, gs = prop_summary(conn), game_summary(conn)
-        props_df, games_df = recent_props(conn), recent_games(conn)
+        show = st.session_state.get('track_show', 'All')
+        props_df, games_df = tracked_props(conn, show), tracked_games(conn, show)
     finally:
         conn.close()
 
     with summary_area:
-        st.caption("Bets settle automatically when you press **Update data** after the games are played, "
-                   "or enter results yourself below. A real edge takes a few hundred bets to show up — "
-                   "under ~100 the record is mostly luck.")
-        for label, s in (("Props", ps), ("Game lines", gs)):
-            st.markdown(f"#### {label}")
-            rec = s['record']
-            c = st.columns(5)
-            c[0].metric("Logged / settled", f"{s['logged']} / {s['settled']}")
-            if rec:
-                c[1].metric("Record (W-L-P)", f"{rec['wins']}-{rec['losses']}-{rec['pushes']}")
-                c[2].metric("Profit", f"{rec['profit']:+.2f} units")
-                c[3].metric("ROI", f"{rec['roi']:+.1%}")
-                c[4].metric("Avg EV claimed", f"{rec['claimed_ev']:+.1%}")
-            else:
-                c[1].metric("Record (W-L-P)", "—")
-            cal = s.get('calibration')
-            if cal:
-                better = cal['brier_model'] < cal['brier_market']
-                st.markdown(f"Model vs market on **{cal['n']}** settled props (lower Brier score = better "
-                            f"forecaster): model **{cal['brier_model']:.4f}**, market "
-                            f"**{cal['brier_market']:.4f}** → {'✅ model better' if better else '❌ market better'}"
-                            + (" *(too few to mean much yet)*" if cal['n'] < 100 else ""))
+        c1, c2 = st.columns([4, 1])
+        c1.caption("Press **📌 Track this** on any prop or game line. Once the game is over, the result fills in "
+                   "here by itself when the app pulls new games (on opening it, or with **🔄 Update data**).")
+        if c2.button("🔄 Check for results", width="stretch", key="check_results"):
+            with st.status("Pulling the latest games...", expanded=True) as status:
+                ok = pull_data()
+                status.update(label="Up to date" if ok else "Update failed", state="complete" if ok else "error")
+            if ok:
+                st.rerun()
+        st.radio("Show", ["All", "Pending", "Finished"], horizontal=True, key="track_show")
 
-        st.markdown("#### Logged props")
-        st.dataframe(props_df, hide_index=True, width="stretch")
-        st.markdown("#### Logged game lines")
-        st.dataframe(games_df, hide_index=True, width="stretch")
+        st.markdown("#### 🎯 Props")
+        tracked_metrics(ps)
+        tracked_table(props_df, "Nothing here yet." if show == 'All' else f"No {show.lower()} props.")
+        st.markdown("#### 🏀 Game lines")
+        tracked_metrics(gs)
+        tracked_table(games_df, "Nothing here yet." if show == 'All' else f"No {show.lower()} game lines.")
+
+        cal = ps.get('calibration')
+        if cal:
+            better = cal['brier_model'] < cal['brier_market']
+            st.markdown(f"**Model vs market** on **{cal['n']}** settled props you evaluated, tracked or not (lower "
+                        f"Brier score = better forecaster): model **{cal['brier_model']:.4f}**, market "
+                        f"**{cal['brier_market']:.4f}** → {'✅ model better' if better else '❌ market better'}"
+                        + (" *(too few to mean much yet)*" if cal['n'] < 100 else ""))
+        st.caption("A real edge takes a few hundred bets to show up. Under ~100 the record is mostly luck.")

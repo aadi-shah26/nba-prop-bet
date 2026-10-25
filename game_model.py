@@ -522,7 +522,9 @@ def stale_warning(ctx):
     return None
 
 
-def log_game_evals(conn, game_date, pred, evals, book=None):
+def log_game_evals(conn, game_date, pred, evals, book=None, tracked=False):
+    """Save evaluated markets. tracked=True marks them as bets you're following ("Track this");
+    re-logging never un-tracks a market."""
     now = datetime.now(timezone.utc).isoformat(timespec='seconds')
     for e in evals:
         conn.execute("""INSERT OR IGNORE INTO game_log (logged_at, game_date, home, away, market, line,
@@ -531,7 +533,27 @@ def log_game_evals(conn, game_date, pred, evals, book=None):
                      (now, game_date, pred['home'], pred['away'], e['market'], e['line'],
                       int(e['odds_a']), int(e['odds_b']), book or '', pred['pred_home'], pred['pred_away'],
                       e['p_a'], e['p_b'], e['fair_a'], e['ev_a'], e['ev_b'], e['pick']))
+        if tracked:
+            conn.execute("UPDATE game_log SET tracked = 1 WHERE id = ?",
+                         (game_log_id(conn, game_date, pred, e, book),))
     conn.commit()
+
+
+def game_log_id(conn, game_date, pred, e, book=None, tracked_only=False):
+    """Row id of one evaluated market in game_log (None if it isn't there / isn't tracked)."""
+    row = conn.execute("SELECT id FROM game_log WHERE game_date=? AND home=? AND away=? AND market=? "
+                       "AND line IS ? AND odds_a=? AND odds_b=? AND book=?"
+                       + (" AND tracked=1" if tracked_only else ""),
+                       (game_date, pred['home'], pred['away'], e['market'], e['line'], int(e['odds_a']),
+                        int(e['odds_b']), book or '')).fetchone()
+    return row[0] if row else None
+
+
+def untrack_game_bet(conn, row_id):
+    """Stop following one game market. The evaluation stays as calibration data."""
+    n = conn.execute("UPDATE game_log SET tracked = 0 WHERE id = ?", (row_id,)).rowcount
+    conn.commit()
+    return n > 0
 
 
 def game_result(market, line, pick, home_pts, away_pts, home, away):
@@ -706,6 +728,7 @@ def main():
     print_game(pred, ctx, evals)
     if evals and not a.no_log:
         log_game_evals(conn, ctx.game_date, pred, evals)
+        log_game_evals(conn, ctx.game_date, pred, [e for e in evals if e['pick'] != 'PASS'], tracked=True)
 
 
 if __name__ == '__main__':

@@ -32,6 +32,23 @@ def init_db(conn):
     sorted alphabetically and rows filed under the wrong player names)."""
     conn.execute('DROP TABLE IF EXISTS game_logs')
     conn.executescript(SCHEMA_PATH.read_text())
+    # Logs created before "Track this" existed lack the column. Back then every evaluation was
+    # logged, so carry over only the actual bets as tracked; passes stay as calibration data.
+    for table, bets in (('prop_log', "('OVER', 'UNDER')"), ('game_log', "('A', 'B')")):
+        if 'tracked' not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN tracked INTEGER NOT NULL DEFAULT 0")
+            conn.execute(f"UPDATE {table} SET tracked = 1 WHERE pick IN {bets}")
+    conn.commit()
+
+
+def get_meta(conn, key):
+    row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT INTO app_meta (key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
     conn.commit()
 
 

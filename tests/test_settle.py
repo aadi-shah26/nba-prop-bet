@@ -22,11 +22,11 @@ def test_prop_settlement(league_conn, capsys):
     for line in (actual - 0.5, actual + 0.5, float(actual)):
         r = evaluate_prop(ctx, pid, 'PTS', line, -110, -110, opponent=away, min_ev=-1.0)  # force a pick
         assert r['pick'] in ('OVER', 'UNDER')
-        log_prop(league_conn, r, 'testbook')
+        log_prop(league_conn, r, 'testbook', tracked=True)
     # a prop for a game the player didn't play (date with games after it in DB) -> DNP
     r = evaluate_prop(ctx, pid, 'PTS', 20.5, -110, -110, min_ev=1.0)
     r['game_date'] = '2025-10-01'
-    log_prop(league_conn, r, 'testbook')
+    log_prop(league_conn, r, 'testbook', tracked=True)
     assert settle_props(league_conn) == 4
     rows = league_conn.execute("SELECT line, pick, actual, result FROM prop_log ORDER BY id").fetchall()
     for line, pick, act, res in rows[:3]:
