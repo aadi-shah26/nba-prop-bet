@@ -9,6 +9,7 @@ when the stored copy is more than STALE_HOURS old.
 """
 
 import argparse
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -18,10 +19,12 @@ from db import connect, init_db, season_for_date, season_str, to_date
 # Game id prefix -> kept: regular season, playoffs, play-in, NBA Cup final (no preseason / All-Star)
 GAME_TYPES = ('002', '004', '005', '006')
 STALE_HOURS = 6
+RETRY_SECONDS = 1800     # after a failed fetch, don't make the page wait on another one for this long
+_failed_at = {}
 COLS = ['game_id', 'game_date', 'season', 'tip_utc', 'status', 'home', 'away', 'label']
 
 
-def fetch_schedule(season, timeout=30):
+def fetch_schedule(season, timeout=15):
     """Raw ScheduleLeagueV2 frame for a season (start year)."""
     from nba_api.stats.endpoints import scheduleleaguev2
     return scheduleleaguev2.ScheduleLeagueV2(season=season_str(season), timeout=timeout).get_data_frames()[0]
@@ -67,18 +70,24 @@ def age_hours(conn, season):
     return (datetime.now(timezone.utc) - datetime.fromisoformat(t)).total_seconds() / 3600
 
 
-def ensure_schedule(conn, game_date):
-    """Fetch the schedule for `game_date`'s season if we don't have it, or if it's the current
-    season and older than STALE_HOURS (tip times and postponements change). Returns an error
-    message if the fetch failed (the stored copy, if any, is still used), else None."""
+def ensure_schedule(conn, game_date, refresh_stale=True):
+    """Fetch the schedule for `game_date`'s season if we don't have it, or (refresh_stale) if it's
+    the current season and older than STALE_HOURS (tip times and postponements change). Returns an
+    error message if the fetch failed (the stored copy, if any, is still used), else None. After a
+    failure it doesn't try again for RETRY_SECONDS, so a blocked stats.nba.com can't stall every
+    page load."""
     season = season_for_date(game_date)
     age = age_hours(conn, season)
-    if age is not None and (season != season_for_date(None) or age < STALE_HOURS):
+    if age is not None and (not refresh_stale or season != season_for_date(None) or age < STALE_HOURS):
         return None
+    if time.time() - _failed_at.get(season, (0, ''))[0] < RETRY_SECONDS:
+        return _failed_at[season][1]
     try:
         refresh_schedule(conn, season, log=lambda *_: None)
     except Exception as e:  # stats.nba.com blocks / times out now and then
-        return f"{type(e).__name__}: {e}"
+        _failed_at[season] = (time.time(), f"{type(e).__name__}: {e}")
+        return _failed_at[season][1]
+    _failed_at.pop(season, None)
     return None
 
 

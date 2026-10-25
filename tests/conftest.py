@@ -69,6 +69,8 @@ def make_league(seasons=(2024, 2025), games_per_pair=4, seed=0, team_strength=No
 def no_auto_update(monkeypatch):
     """The app pulls stats.nba.com and team logos when opened; tests must stay offline."""
     monkeypatch.setenv('NBA_AUTO_UPDATE', '0')
+    import nba_schedule
+    monkeypatch.setattr(nba_schedule, '_failed_at', {})     # schedule fetch backoff is per process
     monkeypatch.setenv('NBA_LOGOS', '0')
 
 

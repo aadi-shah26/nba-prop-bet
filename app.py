@@ -20,6 +20,7 @@ import pandas as pd
 import streamlit as st
 
 from bet_signals import delete_prop, evaluate_prop, log_prop, prop_log_id, settle_prop_manual, untrack_prop
+import background
 import nba_injuries
 import nba_schedule
 import odds_fetcher
@@ -109,7 +110,8 @@ def slate(game_date):
     schedule from stats.nba.com when the stored copy is missing or stale."""
     conn = db()
     try:
-        err = nba_schedule.ensure_schedule(conn, game_date)
+        # a stale copy is refreshed by the background update rather than making this page wait
+        err = nba_schedule.ensure_schedule(conn, game_date, refresh_stale=not auto_enabled())
         return nba_schedule.games_on(conn, game_date), nba_schedule.next_game_date(conn, game_date), err
     finally:
         conn.close()
@@ -279,29 +281,53 @@ def pull_data(retries=4):
     return True
 
 
+def auto_enabled():
+    return os.getenv('NBA_AUTO_UPDATE', '1') != '0'
+
+
 def auto_update():
-    """When the app opens, pull the latest games (which also settles tracked bets), so the data
-    reaches today without pressing Update data. Once per browser session, and not again within
-    AUTO_UPDATE_MINUTES of the last try (another tab, a refresh). NBA_AUTO_UPDATE=0 turns it off."""
-    if st.session_state.get('auto_update_done') or os.getenv('NBA_AUTO_UPDATE', '1') == '0':
+    """When the app opens, pull the latest games (which also settles tracked bets) in the
+    background, so the page shows the saved data straight away and refreshes once new games are
+    in. Only when something is due (a scheduled game has finished since the last load, or the
+    schedule/rosters are old), once per browser session, and not again within AUTO_UPDATE_MINUTES
+    of the last try. NBA_AUTO_UPDATE=0 turns it off."""
+    if st.session_state.get('auto_update_done') or not auto_enabled():
         return
     st.session_state['auto_update_done'] = True
+    from daily_update import update_due
     conn = db()
     try:
         last = get_meta(conn, 'last_update_attempt')
         now = datetime.now(timezone.utc)
         if last and now - datetime.fromisoformat(last) < timedelta(minutes=AUTO_UPDATE_MINUTES):
             return
-        # recorded before trying, so being offline doesn't stall every page open
+        if not update_due(conn):
+            return
+        # recorded before trying, so being offline doesn't retry on every page open
         set_meta(conn, 'last_update_attempt', now.isoformat(timespec='seconds'))
     finally:
         conn.close()
-    with st.status("Pulling the latest games from stats.nba.com...", expanded=False) as status:
-        if pull_data(retries=2):
-            status.update(label="Data is up to date", state="complete")
-        else:
-            status.update(label="Couldn't pull new games, so the saved data is in use. Press Update data "
-                                "to try again.", state="error")
+    background.start(retries=2)
+    st.session_state['bg_watch'] = data_version()
+
+
+@st.fragment(run_every=2)
+def update_watcher():
+    """Sidebar note while the background update runs; reruns the page with the new data after."""
+    if background.status()['running']:
+        st.caption(":material/sync: Pulling new games in the background. Everything works meanwhile.")
+        return
+    if 'bg_watch' not in st.session_state:     # already handled; the rerun below stops this timer
+        return
+    before = st.session_state.pop('bg_watch')
+    err = background.status()['error']
+    slate.clear()
+    if err:
+        st.session_state['toast'] = "Couldn't pull new games, so the saved data is in use. Update data retries."
+    elif data_version() != before:
+        player_options.clear()
+        st.session_state['toast'] = "New games loaded and tracked bets settled."
+    st.rerun()                                  # full rerun: shows the new data and ends the fragment
 
 
 def _api_call(fn, *args):
@@ -330,8 +356,12 @@ with st.sidebar:
         fresh = ui.pill("Data current", "pos") if days <= 1 else ui.pill(f"Data {days} days old", "warn")
         ui.show(f"{fresh}")
         st.caption(f"Games through **{last_game}** · {n_player_games:,} player-games")
+    elif 'bg_watch' in st.session_state:
+        st.info("Downloading the last 3 seasons (about a minute). The page fills in when it's done.")
     else:
         st.warning("No data yet. Press **Update data** to download the last 3 seasons (~1 minute).")
+    if 'bg_watch' in st.session_state:
+        update_watcher()
 
     conn = db()
     refreshed = get_meta(conn, 'last_update')
@@ -343,6 +373,7 @@ with st.sidebar:
                  help="Downloads the latest box scores from stats.nba.com, settles your tracked bets "
                       "and recalibrates the game model. The app also does this by itself when you open it."):
         with st.status("Updating...", expanded=True) as status:
+            background.wait()            # don't run alongside an automatic update
             ok = pull_data()
             status.update(label="Data updated" if ok else "Update failed", state="complete" if ok else "error")
         if ok:

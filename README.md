@@ -18,12 +18,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Opening the app pulls the latest games from stats.nba.com by itself (the first time it
-downloads 3 seasons, about a minute). It adds last night's games, settles your tracked bets and
+Opening the app pulls the latest games from stats.nba.com by itself, in the background: the
+page shows your saved data straight away and refreshes on its own once new games are in (the
+sidebar says when a pull is running). It adds last night's games, settles your tracked bets and
 recalibrates the game model, so the data is current to today without pressing anything. It
-runs at most every 30 minutes; **Update data** in the sidebar does it on demand. If
-stats.nba.com can't be reached, the app says so and uses the saved data. To turn the automatic
-pull off, set `NBA_AUTO_UPDATE=0`.
+only pulls when something can have changed: a scheduled game has finished since the last load,
+the schedule is over 6 hours old, or the rosters are over 20 hours old. It also runs at most
+every 30 minutes. **Update data** in the sidebar refreshes everything on demand. The first run
+downloads 3 seasons (about a minute). If stats.nba.com can't be reached, the app says so and
+uses the saved data. To turn the automatic pull off, set `NBA_AUTO_UPDATE=0`.
 
 ## Using it
 
