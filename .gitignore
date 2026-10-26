@@ -49,6 +49,7 @@ logs/
 
 # Database (rebuild with: python fetch_game_logs.py)
 *.db
+!nba_data.db
 *.db.backup
 *.db.bak
 
