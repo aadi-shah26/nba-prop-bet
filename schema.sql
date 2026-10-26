@@ -159,3 +159,61 @@ DELETE FROM game_log WHERE id NOT IN (
     GROUP BY game_date, home, away, market, IFNULL(line, 'ML'), odds_a, odds_b, IFNULL(book, ''));
 CREATE UNIQUE INDEX IF NOT EXISTS ux_game_log_dedup ON game_log
     (game_date, home, away, market, IFNULL(line, 'ML'), odds_a, odds_b, IFNULL(book, ''));
+
+-- Kalshi bets placed by kalshi_bot.py (mode 'PAPER' until real orders exist), one per game and
+-- market, settled from team_games. client_order_id stops a retried run from betting twice.
+CREATE TABLE IF NOT EXISTS kalshi_orders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    mode            TEXT NOT NULL,           -- 'PAPER'
+    client_order_id TEXT NOT NULL UNIQUE,
+    game_date       TEXT NOT NULL,
+    home            TEXT NOT NULL,
+    away            TEXT NOT NULL,
+    tip_utc         TEXT,
+    market          TEXT NOT NULL,           -- 'WINNER' | 'SPREAD' | 'TOTAL'
+    ticker          TEXT NOT NULL,
+    side            TEXT NOT NULL,           -- 'yes' | 'no'
+    team            TEXT,                    -- team the YES side backs (WINNER/SPREAD)
+    line            REAL,                    -- YES wins if the team's margin / the total is over this
+    description     TEXT NOT NULL,           -- e.g. 'CHA to win', 'Under 218.5'
+    p_model         REAL NOT NULL,           -- probabilities of our side winning
+    p_market        REAL NOT NULL,
+    p_blend         REAL NOT NULL,
+    bid             REAL,
+    ask             REAL NOT NULL,
+    ev              REAL NOT NULL,           -- dollars per contract after fees
+    kelly           REAL NOT NULL,           -- full-Kelly fraction (the stake used kelly_mult of it)
+    count           INTEGER NOT NULL,
+    price           REAL NOT NULL,           -- fill price per contract
+    fee             REAL NOT NULL,
+    cost            REAL NOT NULL,           -- count * price + fee
+    result          TEXT,                    -- 'WIN' | 'LOSS'
+    payout          REAL,
+    profit          REAL,
+    settled_at      TEXT,
+    UNIQUE (mode, game_date, home, away, market)
+);
+
+-- Every Kalshi contract the bot priced, with the model's probability and Kalshi's price when it
+-- was first and last seen before tip-off (last = the closing price for CLV), settled like bets.
+CREATE TABLE IF NOT EXISTS kalshi_snapshots (
+    ticker      TEXT PRIMARY KEY,
+    game_date   TEXT NOT NULL,
+    home        TEXT NOT NULL,
+    away        TEXT NOT NULL,
+    tip_utc     TEXT,
+    market      TEXT NOT NULL,
+    team        TEXT,
+    line        REAL,
+    p_model     REAL NOT NULL,           -- model probability that YES wins (latest run)
+    yes_bid     REAL,
+    yes_ask     REAL,
+    first_seen  TEXT NOT NULL,
+    first_mid   REAL,
+    last_seen   TEXT NOT NULL,
+    last_mid    REAL,
+    decision    TEXT,                    -- 'BET' or why the game-market's best contract was skipped
+    result      INTEGER                  -- 1 = YES won
+);
+CREATE INDEX IF NOT EXISTS idx_kalshi_snap_date ON kalshi_snapshots(game_date);

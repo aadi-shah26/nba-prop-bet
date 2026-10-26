@@ -3,7 +3,7 @@
 Daily maintenance (run once a day after the previous night's games, or press
 "Update data" in the app):
   1. refresh the current season's player and team game logs (first run: last 3 seasons)
-  2. settle logged props and game bets against actual results
+  2. settle logged props, game bets and Kalshi paper bets against actual results
   3. re-calibrate the game model's margin adjustments and margin/total SDs
   4. refresh the season schedule (upcoming games, so the app can list them) and team rosters
 
@@ -19,6 +19,7 @@ from bet_signals import settle_props
 from db import SEASON_TYPES, connect, init_db, season_for_date, season_str, set_meta
 from fetch_game_logs import ingest_season
 from game_model import calibrate, settle_games
+from kalshi_bot import settle as settle_kalshi
 from nba_rosters import refresh_rosters
 from nba_schedule import STALE_HOURS, age_hours, refresh_schedule
 
@@ -86,8 +87,8 @@ def update(conn, log=print, retries=4, quick=False):
         log(f"🔄 Refreshing {season_str(s)}")
         ingest_season(conn, s, season_types=season_types_due(s), log=log, retries=retries)
 
-    n_p, n_g = settle_props(conn), settle_games(conn)
-    log(f"🧾 Settled {n_p} props, {n_g} game bets")
+    n_p, n_g, n_k = settle_props(conn), settle_games(conn), settle_kalshi(conn)
+    log(f"🧾 Settled {n_p} props, {n_g} game bets, {n_k} Kalshi paper bets")
 
     cal = calibrate(conn) if seasons else None
     if cal:
