@@ -177,6 +177,30 @@ def test_big_disagreement_is_flagged_not_bet(conn):
     assert bets == [] and rows[0]['skip'].startswith('FLAG')
 
 
+def test_far_ladder_rung_cant_dodge_a_flagged_game(conn):
+    bank(conn)
+    # model 70% CHA (margin +7) vs Kalshi 45.5%: the winner contract is flagged. A far rung,
+    # "CHA by over 12.5" at 20.5 cents vs the model's 33.5%, is only 13 points apart, which the
+    # per-contract check alone would let through, but it's the same disagreement about the game.
+    rung = contract('SPREAD', 'KXNBASPREAD-26OCT26WASCHA-CHA13', 0.20, 0.21)
+    win = contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.45, 0.46)
+    bets, rows = run_decide(conn, [rung, win])
+    assert bets == []
+    assert all(r['skip'].startswith('FLAG') for r in rows)
+    assert 'home margin' in [r for r in rows if r['market'] == 'SPREAD'][0]['skip']
+
+
+def test_market_centers():
+    cs = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.49, 0.51),
+          contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-WAS', 0.49, 0.51),
+          contract('SPREAD', 'KXNBASPREAD-26OCT26WASCHA-WAS3', 0.38, 0.40),      # tail-ish but in range
+          contract('TOTAL', 'KXNBATOTAL-26OCT26WASCHA-221', 0.49, 0.51),
+          contract('TOTAL', 'KXNBATOTAL-26OCT26WASCHA-251', 0.02, 0.04)]          # tail: ignored
+    c = kalshi_bot.market_centers(cs, 12.9, 19.0)[('CHA', 'WAS')]
+    assert c['total'] == pytest.approx(220.5)
+    assert abs(c['margin']) < 1.5
+
+
 def test_wide_spread_and_tip_off_are_skipped(conn):
     bank(conn)
     wide = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.55, 0.62)]

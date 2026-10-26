@@ -25,7 +25,9 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
+from scipy import stats as sps
 
 from db import connect, get_meta, init_db, set_meta
 from game_model import GameContext, margin_pmf, probs_vs_line, stale_warning, total_pmf
@@ -131,6 +133,46 @@ def candidates(c, p_yes, cfg):
     return out
 
 
+def market_centers(contracts, sd_margin, sd_total):
+    """Kalshi's implied home margin and total for each game, in points: every two-sided rung
+    priced 15-85 cents implies a center (t + sd * z(p) for "over t" at probability p, the
+    model's own normal), and the median of those is the market's line.
+    {(home, away): {'margin': x or None, 'total': y or None}}"""
+    est = {}
+    for c in contracts:
+        yb, ya = c['yes_bid'], c['yes_ask']
+        if yb is None or ya is None or not 0 < yb < ya < 1:
+            continue
+        p = (yb + ya) / 2
+        if c['market'] == 'TOTAL':
+            kind, t, sd = 'total', c['line'], sd_total
+        else:   # "home by over t" is P(margin > t); "away by over t" is P(margin > -t) = 1 - p
+            kind, sd = 'margin', sd_margin
+            t = 0.0 if c['market'] == 'WINNER' else c['line']
+            if c['team'] != c['home']:
+                t, p = -t, 1 - p
+        if 0.15 <= p <= 0.85:
+            est.setdefault((c['home'], c['away']), {}).setdefault(kind, []).append(t + sd * sps.norm.ppf(p))
+    return {g: {k: float(np.median(v[k])) if v.get(k) else None for k in ('margin', 'total')}
+            for g, v in est.items()}
+
+
+def game_flag(pred, centers, market, sd_margin, sd_total, cfg):
+    """Why the model and Kalshi disagree too much about this game to bet any of its rungs, or
+    None. Measured in points, so a far-out ladder rung (where probabilities are compressed) can't
+    sneak past a disagreement the winner market flags. The limit is max_disagree converted to
+    points at a 50/50 line: 15% is about 4.8 points of margin or 7.1 points of total."""
+    kind, sd = ('total', sd_total) if market == 'TOTAL' else ('margin', sd_margin)
+    mkt = (centers or {}).get(kind)
+    if mkt is None:
+        return None
+    gap = pred[kind] - mkt
+    if abs(gap) <= cfg.max_disagree * sd * math.sqrt(2 * math.pi):
+        return None
+    what = 'home margin' if kind == 'margin' else 'total'
+    return f"FLAG: model {what} {pred[kind]:+.1f} vs Kalshi {mkt:+.1f}, check news"
+
+
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
@@ -220,6 +262,12 @@ def decide(conn, contracts, preds, sd_margin, sd_total, cfg, game_date, now=None
         c['p_yes'] = model_prob(c, preds[(c['home'], c['away'])], sd_margin, sd_total)
         for x in candidates(c, c['p_yes'], cfg):
             groups.setdefault((c['home'], c['away'], c['market']), []).append(x)
+    centers = market_centers([c for c in contracts if 'p_yes' in c], sd_margin, sd_total)
+    for (home, away, market), xs in groups.items():
+        flag = game_flag(preds[(home, away)], centers.get((home, away)), market, sd_margin, sd_total, cfg)
+        for x in xs:
+            if flag and (x['skip'] is None or not x['skip'].startswith('FLAG')):
+                x['skip'] = flag
     bets, rows = [], []
     for (home, away, market), xs in sorted(groups.items(), key=lambda kv: (kv[1][0]['tip_utc'] or '', kv[0])):
         ok = [x for x in xs if x['skip'] is None]
