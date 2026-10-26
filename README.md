@@ -245,7 +245,10 @@ game days. Every 15 minutes from 4 pm to midnight, from cron:
 */15 16-23 * * * cd /path/to/nba-prop-bet && python3 kalshi_bot.py run --update >> kalshi.log 2>&1
 ```
 
-Bets settle from the box scores in `daily_update.py` (or `kalshi_bot.py settle`). The plan's gate
+The app's **Kalshi bot** tab shows what the bot did: paper bankroll, record, profit and average
+CLV, every paper bet (price, payout, model vs Kalshi, EV, CLV, result), a day-by-day summary, and
+the games it flagged today. Bets settle from the box scores in `daily_update.py`, which the app
+runs when it pulls new games (or `kalshi_bot.py settle`). The plan's gate
 for real money is 300+ paper bets with positive average CLV.
 
 ## Files

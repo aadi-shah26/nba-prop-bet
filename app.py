@@ -21,6 +21,7 @@ import streamlit as st
 
 from bet_signals import delete_prop, evaluate_prop, log_prop, prop_log_id, settle_prop_manual, untrack_prop
 import background
+import kalshi_bot
 import nba_injuries
 import nba_schedule
 import odds_fetcher
@@ -41,7 +42,7 @@ STAT_LABELS = {
     'STL': 'Steals', 'BLK': 'Blocks', 'SB': 'Steals + Blocks', 'TOV': 'Turnovers',
 }
 AUTO_UPDATE_MINUTES = 30    # opening the app pulls new games at most this often
-TABS = ["Player props", "Games", "Tracked bets"]
+TABS = ["Player props", "Games", "Tracked bets", "Kalshi bot"]
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +398,7 @@ if not n_player_games:
 ui.app_header(f"Model data through {last_game}")
 if 'goto_tab' in st.session_state:   # set after tracking; must be applied before the tabs are drawn
     st.session_state['main_tab'] = st.session_state.pop('goto_tab')
-tab_prop, tab_game, tab_results = st.tabs(TABS, key="main_tab", on_change="rerun")
+tab_prop, tab_game, tab_results, tab_kalshi = st.tabs(TABS, key="main_tab", on_change="rerun")
 if 'toast' in st.session_state:
     st.toast(st.session_state.pop('toast'), icon=":material/check_circle:")
 
@@ -1194,3 +1195,83 @@ with tab_results:
                     f"<b>{cal['brier_model']:.4f}</b>, market <b>{cal['brier_market']:.4f}</b> (lower is better)."
                     + (" <i>Too few to mean much yet.</i>" if cal['n'] < 100 else ""))
         st.caption("A real edge takes a few hundred bets to show up. Under ~100 the record is mostly luck.")
+
+
+# ---------------------------------------------------------------------------
+# Kalshi bot: the paper trades kalshi_bot.py made (it runs outside the app)
+# ---------------------------------------------------------------------------
+
+KALSHI_CONFIG = {
+    'Price': st.column_config.NumberColumn(format="%.0f¢", help="Paid per contract; it pays $1 if it wins"),
+    'Pays': st.column_config.NumberColumn(format="%.2fx", help="Payout multiplier: $1 / price"),
+    'Qty': st.column_config.NumberColumn(help="Contracts bought"),
+    'Cost': st.column_config.NumberColumn(format="$%.2f", help="Contracts × price + Kalshi's fee"),
+    'Model %': st.column_config.NumberColumn("Model", format="%.0f%%"),
+    'Kalshi %': st.column_config.NumberColumn("Kalshi", format="%.0f%%", help="Kalshi's mid price when it bet"),
+    'EV': st.column_config.NumberColumn(format="%+.1f¢", help="Expected profit per contract after fees"),
+    'CLV': st.column_config.NumberColumn(format="%+.1f¢", help="Closing-line value: our side's last Kalshi "
+                                                               "price before tip-off minus the price paid. "
+                                                               "Positive = the market moved our way"),
+    'Profit': st.column_config.NumberColumn(format="$%+.2f"),
+    'Staked': st.column_config.NumberColumn(format="$%.2f"),
+    'ROI': st.column_config.NumberColumn(format="%+.1f%%"),
+}
+
+
+def et_time(iso):
+    t = pd.Timestamp(iso).tz_convert('America/New_York')
+    return f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M} {'am' if t.hour < 12 else 'pm'} ET"
+
+
+with tab_kalshi:
+    conn = db()
+    try:
+        rep = kalshi_bot.report(conn)
+        start = float(get_meta(conn, kalshi_bot.BANKROLL_KEY) or 0)
+        show = st.session_state.get('kalshi_show') or 'All'
+        bets, days = kalshi_bot.paper_bets(conn, show), kalshi_bot.daily_summary(conn)
+        flags, ran = kalshi_bot.flagged(conn, kalshi_bot.et_today()), kalshi_bot.last_run(conn)
+    finally:
+        conn.close()
+
+    st.caption("Paper trades only: no money moves. The bot runs outside the app (`python kalshi_bot.py run`, "
+               "ideally every 15 minutes on game days); this tab shows what it did. Bets settle when the app "
+               "pulls new games.")
+    ui.show(f"{ui.pill('Last run ' + et_time(ran), 'flat') if ran else ui.pill('Not run yet', 'neg')}")
+    if rep['bets'] == 0:
+        st.info("No paper bets yet. Run `python kalshi_bot.py run --update` in the project folder.",
+                icon=":material/info:")
+    else:
+        c = st.columns([1.5, 0.8, 1, 1, 1])
+        c[0].metric("Paper bankroll", f"${rep['bankroll']:,.0f}",
+                    delta=f"{rep['bankroll'] - start:+,.2f}" if start and rep['settled'] else None,
+                    help=f"Started at ${start:,.2f}; changes as bets settle")
+        c[1].metric("Bets", rep['bets'], help=f"{rep['bets'] - rep['settled']} waiting on the game")
+        c[2].metric("Record (W-L)", f"{rep['wins']}-{rep['settled'] - rep['wins']}" if rep['settled'] else "–")
+        c[3].metric("Profit", f"${rep['profit']:+,.2f}" if rep['settled'] else "–",
+                    help=f"ROI {rep['roi']:+.1%} on ${rep['staked']:,.2f} settled" if rep['roi'] is not None else None)
+        c[4].metric("Avg CLV", f"{rep['clv'] * 100:+.2f}¢" if rep['clv'] is not None else "–",
+                    help=f"Over {rep['clv_n']} bets. The gate for real money is positive CLV over 300+ bets.")
+        if 'brier_n' in rep:
+            better = rep['brier_model'] < rep['brier_kalshi']
+            ui.show(f"{ui.pill('Model better' if better else 'Kalshi better', 'pos' if better else 'neg')} "
+                    f"&nbsp;Brier score on <b>{rep['brier_n']}</b> settled winner contracts, bet or not: model "
+                    f"<b>{rep['brier_model']:.4f}</b>, Kalshi <b>{rep['brier_kalshi']:.4f}</b> (lower is better)."
+                    + (" <i>Too few to mean much yet.</i>" if rep['brier_n'] < 200 else ""))
+
+    if not flags.empty:
+        st.subheader("Flagged today")
+        st.caption("Model and Kalshi disagree too much to bet. Usually injury news the model hasn't seen.")
+        st.dataframe(flags, hide_index=True)
+
+    if rep['bets']:
+        st.subheader("Paper bets")
+        st.segmented_control("Show", ["All", "Pending", "Finished"], default="All", key="kalshi_show",
+                             label_visibility="collapsed")
+        if bets.empty:
+            st.caption(f"No {show.lower()} bets.")
+        else:
+            st.dataframe(bets, hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
+        st.subheader("By day")
+        st.dataframe(days, hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
+        st.caption("One night is noise. Judge the bot on CLV after a few hundred bets, not on the record.")

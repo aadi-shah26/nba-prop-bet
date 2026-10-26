@@ -382,3 +382,29 @@ def test_scan_fails_closed_on_stale_data(conn):
     with pytest.raises(RuntimeError, match='Ratings use games'):
         kalshi_bot.scan(conn, '2026-03-01', BotConfig(), client=kalshi_client.KalshiClient(session=FakeKalshi({})),
                         use_injuries=False)
+
+
+def test_summary_helpers(conn, monkeypatch):
+    bank(conn)
+    cs = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.59, 0.60)]
+    bets, rows = run_decide(conn, cs, BotConfig(markets=('WINNER',)))
+    record_snapshots(conn, cs, rows, now=NOON)
+    record_bets(conn, bets, now=NOON)
+    flag = [contract('SPREAD', 'KXNBASPREAD-26OCT26WASCHA-CHA13', 0.20, 0.21)]   # far off the model
+    _, frows = run_decide(conn, flag)
+    record_snapshots(conn, flag, frows, now=NOON)
+    assert kalshi_bot.last_run(conn) == NOON.isoformat(timespec='seconds')
+    f = kalshi_bot.flagged(conn, '2026-10-26')
+    assert list(f['Game']) == ['WAS @ CHA'] and list(f['Market']) == ['Spread']
+    assert not f['Why'].iloc[0].startswith('FLAG')
+
+    monkeypatch.setattr(kalshi_bot, 'now_utc', lambda: NOON)                    # before tip: no CLV yet
+    b = kalshi_bot.paper_bets(conn)
+    assert list(b['Bet']) == ['CHA to win'] and b['CLV'].isna().all() and list(b['Result']) == ['Pending']
+    assert b['Pays'].iloc[0] == pytest.approx(1 / 0.60)
+    assert kalshi_bot.paper_bets(conn, 'Finished').empty
+    add_final(conn, 110, 100)
+    settle(conn)
+    d = kalshi_bot.daily_summary(conn)
+    assert list(d['Date']) == ['Oct 26'] and d['Won'].iloc[0] == 1
+    assert d['ROI'].iloc[0] == pytest.approx(d['Profit'].iloc[0] / d['Staked'].iloc[0] * 100)

@@ -422,6 +422,51 @@ def report(conn):
     return out
 
 
+def paper_bets(conn, show='All'):
+    """Paper bets for display, newest first. show: 'All' | 'Pending' | 'Finished'. CLV (cents per
+    contract) is our side's last pre-tip mid minus what we paid, once the game has tipped off."""
+    where = {'Pending': ' AND o.result IS NULL', 'Finished': ' AND o.result IS NOT NULL'}.get(show, '')
+    o = pd.read_sql_query(
+        "SELECT o.*, s.last_mid FROM kalshi_orders o LEFT JOIN kalshi_snapshots s ON s.ticker = o.ticker "
+        f"WHERE o.mode = ?{where} ORDER BY o.game_date DESC, o.tip_utc, o.id", conn, params=(MODE,))
+    close = o['last_mid'].where(o['side'] == 'yes', 1 - o['last_mid'])
+    started = pd.to_datetime(o['tip_utc'], utc=True) <= now_utc()
+    return pd.DataFrame({
+        'Date': pd.to_datetime(o['game_date']).dt.strftime('%b %-d'), 'Game': o['away'] + ' @ ' + o['home'],
+        'Bet': o['description'],
+        'Price': o['price'] * 100, 'Pays': 1 / o['price'], 'Qty': o['count'], 'Cost': o['cost'],
+        'Model %': o['p_model'] * 100, 'Kalshi %': o['p_market'] * 100, 'EV': o['ev'] * 100,
+        'CLV': ((close - o['price']) * 100).where(started),
+        'Result': o['result'].fillna('Pending'), 'Profit': o['profit'],
+    })
+
+
+def daily_summary(conn):
+    """Per game date: bets, staked, settled profit and ROI."""
+    d = pd.read_sql_query(
+        "SELECT game_date AS Date, COUNT(*) AS Bets, SUM(cost) AS Staked, "
+        "SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) AS Won, "
+        "SUM(CASE WHEN result IS NOT NULL THEN 1 ELSE 0 END) AS Settled, SUM(profit) AS Profit, "
+        "SUM(profit) / NULLIF(SUM(CASE WHEN result IS NOT NULL THEN cost END), 0) * 100 AS ROI "
+        "FROM kalshi_orders WHERE mode = ? GROUP BY game_date ORDER BY game_date DESC", conn, params=(MODE,))
+    d['Date'] = pd.to_datetime(d['Date']).dt.strftime('%b %-d')
+    return d
+
+
+def flagged(conn, game_date):
+    """Game-markets the last run on `game_date` flagged for a human (big model-vs-Kalshi gaps)."""
+    return pd.read_sql_query(
+        "SELECT away || ' @ ' || home AS Game, market AS Market, decision AS Why FROM kalshi_snapshots "
+        "WHERE game_date = ? AND decision LIKE 'FLAG%' GROUP BY home, away, market ORDER BY tip_utc",
+        conn, params=(game_date,)).assign(Market=lambda d: d['Market'].str.title(),
+                                          Why=lambda d: d['Why'].str.removeprefix('FLAG: '))
+
+
+def last_run(conn):
+    """When `run` last recorded Kalshi prices (UTC ISO), or None."""
+    return conn.execute("SELECT MAX(last_seen) FROM kalshi_snapshots").fetchone()[0]
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

@@ -393,3 +393,41 @@ def test_auto_update_runs_in_background(app_db, monkeypatch):
     assert background.status()['error'] == "ConnectionError: offline"
     at.run()
     assert not at.exception                                         # falls back to saved data
+
+
+def test_kalshi_tab(app_db):
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception
+    assert any('No paper bets yet' in i.value for i in at.info)
+
+    import kalshi_bot
+    db.set_meta(app_db, kalshi_bot.BANKROLL_KEY, 1000)
+    bets = [dict(ticker='KXNBAGAME-26JAN10LALBOS-BOS', market='WINNER', game_date='2026-01-10', home='BOS',
+                 away='LAL', tip_utc='2026-01-11T00:30:00Z', team='BOS', line=None, side='yes', desc='BOS to win',
+                 p_model=0.66, p_market=0.575, p_blend=0.6175, yes_bid=0.57, no_bid=0.42, ask=0.58, ev=0.02,
+                 kelly=0.08, count=30, fee=0.52, cost=17.92),
+            dict(ticker='KXNBATOTAL-26JAN10LALBOS-221', market='TOTAL', game_date='2026-01-10', home='BOS',
+                 away='LAL', tip_utc='2026-01-11T00:30:00Z', team=None, line=220.5, side='no', desc='Under 220.5',
+                 p_model=0.55, p_market=0.45, p_blend=0.50, yes_bid=0.54, no_bid=0.45, ask=0.46, ev=0.023,
+                 kelly=0.05, count=20, fee=0.35, cost=9.55)]
+    kalshi_bot.record_bets(app_db, bets)
+    app_db.execute("INSERT INTO kalshi_snapshots (ticker, game_date, home, away, tip_utc, market, team, p_model, "
+                   "first_seen, first_mid, last_seen, last_mid, decision) VALUES "
+                   "('KXNBAGAME-26JAN10LALBOS-BOS', '2026-01-10', 'BOS', 'LAL', '2026-01-11T00:30:00Z', 'WINNER', "
+                   "'BOS', 0.66, '2026-01-10T20:00:00+00:00', 0.575, '2026-01-11T00:15:00+00:00', 0.61, 'BET')")
+    app_db.execute("UPDATE kalshi_orders SET result = 'WIN', payout = 30, profit = 12.08 WHERE market = 'WINNER'")
+    app_db.commit()
+
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    assert not at.exception
+    table = next(df.value for df in at.dataframe if 'CLV' in df.value.columns)
+    assert list(table['Bet']) == ['BOS to win', 'Under 220.5']
+    assert table['CLV'].iloc[0] == pytest.approx(3.0)            # closed at 61, paid 58
+    assert list(table['Result']) == ['WIN', 'Pending']
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics['Paper bankroll'] == '$1,012' and metrics['Record (W-L)'] == '1-0'
+    assert any('Last run' in m.value for m in at.markdown)
+    at.segmented_control(key='kalshi_show').set_value('Pending')
+    at.run()
+    table = next(df.value for df in at.dataframe if 'CLV' in df.value.columns)
+    assert list(table['Bet']) == ['Under 220.5']
