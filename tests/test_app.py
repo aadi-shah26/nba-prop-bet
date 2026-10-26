@@ -420,14 +420,49 @@ def test_kalshi_tab(app_db):
 
     at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
     assert not at.exception
+    assert any('No paper bets for today yet' in c.value for c in at.caption)     # opens on today's bets
+    at.segmented_control(key='kalshi_show').set_value('All')
+    at.run()
     table = next(df.value for df in at.dataframe if 'CLV' in df.value.columns)
     assert list(table['Bet']) == ['BOS to win', 'Under 220.5']
     assert table['CLV'].iloc[0] == pytest.approx(3.0)            # closed at 61, paid 58
     assert list(table['Result']) == ['WIN', 'Pending']
     metrics = {m.label: m.value for m in at.metric}
     assert metrics['Paper bankroll'] == '$1,012' and metrics['Record (W-L)'] == '1-0'
-    assert any('Last run' in m.value for m in at.markdown)
     at.segmented_control(key='kalshi_show').set_value('Pending')
     at.run()
     table = next(df.value for df in at.dataframe if 'CLV' in df.value.columns)
     assert list(table['Bet']) == ['Under 220.5']
+
+
+def test_kalshi_bot_runs_when_the_app_opens(app_db, monkeypatch):
+    import background
+    import daily_update
+    import kalshi_bot
+    calls = []
+
+    def fake_attempt(conn):
+        calls.append(1)
+        kalshi_bot.set_status(conn, '2 new paper bets')
+        return '2 new paper bets'
+    monkeypatch.setenv('NBA_AUTO_UPDATE', '1')
+    monkeypatch.setattr(daily_update, 'update_due', lambda conn: None)       # no new games to pull
+    monkeypatch.setattr(kalshi_bot, 'due', lambda conn: True)
+    monkeypatch.setattr(kalshi_bot, 'attempt', fake_attempt)
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    background.wait(10)
+    assert calls == [1] and background.status()['kalshi'] == '2 new paper bets'
+    at.run()
+    assert not at.exception
+    assert any('Last run' in m.value and '2 new paper bets' in m.value for m in at.markdown)
+
+    monkeypatch.setenv('NBA_KALSHI_AUTO', '0')                                # switched off: no run
+    st_testing.AppTest.from_file(APP, default_timeout=120).run()
+    background.wait(10)
+    assert calls == [1]
+
+    at = st_testing.AppTest.from_file(APP, default_timeout=120).run()        # the button still works
+    at.button(key='kalshi_run').click()
+    at.run()
+    background.wait(10)
+    assert calls == [1, 1]

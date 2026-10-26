@@ -286,12 +286,18 @@ def auto_enabled():
     return os.getenv('NBA_AUTO_UPDATE', '1') != '0'
 
 
+def kalshi_auto_enabled():
+    return os.getenv('NBA_KALSHI_AUTO', '1') != '0'
+
+
 def auto_update():
     """When the app opens, pull the latest games (which also settles tracked bets) in the
     background, so the page shows the saved data straight away and refreshes once new games are
     in. Only when something is due (a scheduled game has finished since the last load, or the
     schedule/rosters are old), once per browser session, and not again within AUTO_UPDATE_MINUTES
-    of the last try. NBA_AUTO_UPDATE=0 turns it off."""
+    of the last try. On game days the same job then runs the Kalshi paper bot (kalshi_bot.due:
+    a game still before its betting cutoff, at most every 15 minutes). NBA_AUTO_UPDATE=0 turns
+    both off; NBA_KALSHI_AUTO=0 turns off just the bot."""
     if st.session_state.get('auto_update_done') or not auto_enabled():
         return
     st.session_state['auto_update_done'] = True
@@ -300,15 +306,19 @@ def auto_update():
     try:
         last = get_meta(conn, 'last_update_attempt')
         now = datetime.now(timezone.utc)
-        if last and now - datetime.fromisoformat(last) < timedelta(minutes=AUTO_UPDATE_MINUTES):
-            return
-        if not update_due(conn):
-            return
-        # recorded before trying, so being offline doesn't retry on every page open
-        set_meta(conn, 'last_update_attempt', now.isoformat(timespec='seconds'))
+        do_update = (not last or now - datetime.fromisoformat(last) >= timedelta(minutes=AUTO_UPDATE_MINUTES)) \
+            and bool(update_due(conn))
+        if do_update:   # recorded before trying, so being offline doesn't retry on every page open
+            set_meta(conn, 'last_update_attempt', now.isoformat(timespec='seconds'))
+        do_kalshi = kalshi_auto_enabled() and kalshi_bot.due(conn)
     finally:
         conn.close()
-    background.start(retries=2)
+    if do_update or do_kalshi:
+        start_background(update=do_update, kalshi=do_kalshi)
+
+
+def start_background(update=True, kalshi=False):
+    background.start(retries=2, update=update, kalshi=kalshi)
     st.session_state['bg_watch'] = data_version()
 
 
@@ -316,18 +326,21 @@ def auto_update():
 def update_watcher():
     """Sidebar note while the background update runs; reruns the page with the new data after."""
     if background.status()['running']:
-        st.caption(":material/sync: Pulling new games in the background. Everything works meanwhile.")
+        st.caption(":material/sync: Pulling new games and running the Kalshi bot in the background. "
+                   "Everything works meanwhile.")
         return
     if 'bg_watch' not in st.session_state:     # already handled; the rerun below stops this timer
         return
     before = st.session_state.pop('bg_watch')
-    err = background.status()['error']
+    err, bot = background.status()['error'], background.status()['kalshi']
     slate.clear()
     if err:
         st.session_state['toast'] = "Couldn't pull new games, so the saved data is in use. Update data retries."
     elif data_version() != before:
         player_options.clear()
         st.session_state['toast'] = "New games loaded and tracked bets settled."
+    if bot:
+        st.session_state['toast'] = (st.session_state.get('toast', '') + f" Kalshi bot: {bot}.").strip()
     st.rerun()                                  # full rerun: shows the new data and ends the fragment
 
 
@@ -1228,19 +1241,27 @@ with tab_kalshi:
     try:
         rep = kalshi_bot.report(conn)
         start = float(get_meta(conn, kalshi_bot.BANKROLL_KEY) or 0)
-        show = st.session_state.get('kalshi_show') or 'All'
+        show = st.session_state.get('kalshi_show') or 'Today'
         bets, days = kalshi_bot.paper_bets(conn, show), kalshi_bot.daily_summary(conn)
-        flags, ran = kalshi_bot.flagged(conn, kalshi_bot.et_today()), kalshi_bot.last_run(conn)
+        flags, status = kalshi_bot.flagged(conn, kalshi_bot.et_today()), kalshi_bot.last_status(conn)
     finally:
         conn.close()
 
-    st.caption("Paper trades only: no money moves. The bot runs outside the app (`python kalshi_bot.py run`, "
-               "ideally every 15 minutes on game days); this tab shows what it did. Bets settle when the app "
-               "pulls new games.")
-    ui.show(f"{ui.pill('Last run ' + et_time(ran), 'flat') if ran else ui.pill('Not run yet', 'neg')}")
+    c1, c2 = st.columns([4, 1], vertical_alignment="center")
+    c1.caption("Paper trades only: no money moves. On game days, opening the app runs the bot by itself (at "
+               "most every 15 minutes, until 30 minutes before the last tip-off). It buys before games start "
+               "and holds to the final score. Bets settle when the app pulls new games.")
+    running = background.status()['running']
+    if c2.button("Run bot now", key="kalshi_run", icon=":material/play_arrow:", width="stretch", disabled=running,
+                 help="Price today's Kalshi contracts and record any new paper bets"):
+        start_background(update=False, kalshi=True)
+        st.rerun()
+    if status:
+        ui.show(f"{ui.pill('Last run ' + et_time(status[0]), 'flat')} &nbsp;{ui.esc(status[1])}")
+    else:
+        ui.show(ui.pill('Not run yet', 'neg'))
     if rep['bets'] == 0:
-        st.info("No paper bets yet. Run `python kalshi_bot.py run --update` in the project folder.",
-                icon=":material/info:")
+        st.info("No paper bets yet. Press **Run bot now**, or open the app on a game day.", icon=":material/info:")
     else:
         c = st.columns([1.5, 0.8, 1, 1, 1])
         c[0].metric("Paper bankroll", f"${rep['bankroll']:,.0f}",
@@ -1266,10 +1287,10 @@ with tab_kalshi:
 
     if rep['bets']:
         st.subheader("Paper bets")
-        st.segmented_control("Show", ["All", "Pending", "Finished"], default="All", key="kalshi_show",
+        st.segmented_control("Show", ["Today", "Pending", "Finished", "All"], default="Today", key="kalshi_show",
                              label_visibility="collapsed")
         if bets.empty:
-            st.caption(f"No {show.lower()} bets.")
+            st.caption("No paper bets for today yet." if show == 'Today' else f"No {show.lower()} bets.")
         else:
             st.dataframe(bets, hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
         st.subheader("By day")

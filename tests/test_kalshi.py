@@ -408,3 +408,35 @@ def test_summary_helpers(conn, monkeypatch):
     d = kalshi_bot.daily_summary(conn)
     assert list(d['Date']) == ['Oct 26'] and d['Won'].iloc[0] == 1
     assert d['ROI'].iloc[0] == pytest.approx(d['Profit'].iloc[0] / d['Staked'].iloc[0] * 100)
+
+
+def test_due_only_before_the_last_cutoff_and_not_too_often(conn):
+    conn.execute("INSERT INTO schedule VALUES ('g1', '2026-10-26', 2026, '2026-10-26T23:00:00Z', '7:00 pm ET', "
+                 "'CHA', 'WAS', '', '2026-10-26T12:00:00+00:00')")
+    conn.commit()
+    assert kalshi_bot.due(conn, now=NOON)                                               # noon ET-ish: yes
+    assert not kalshi_bot.due(conn, now=datetime(2026, 10, 26, 22, 45, tzinfo=timezone.utc))   # past cutoff
+    assert not kalshi_bot.due(conn, now=datetime(2026, 10, 27, 16, tzinfo=timezone.utc))       # no games
+    kalshi_bot.set_meta(conn, 'kalshi_last_attempt', '2026-10-26T15:50:00+00:00')
+    assert not kalshi_bot.due(conn, now=NOON)                                           # tried 10 min ago
+    assert kalshi_bot.due(conn, now=datetime(2026, 10, 26, 16, 6, tzinfo=timezone.utc))
+
+
+def test_attempt_records_why_there_are_no_bets(conn, monkeypatch):
+    def down(*a, **k):
+        raise RuntimeError("Kalshi prices unavailable (ConnectionError: offline)")
+    monkeypatch.setattr(kalshi_bot, 'scan', down)
+    msg = kalshi_bot.attempt(conn)
+    assert msg.startswith('no bets') and 'offline' in msg
+    assert kalshi_bot.last_status(conn)[1] == 'no bets: Kalshi prices unavailable (ConnectionError: offline)'
+    assert kalshi_bot.get_meta(conn, 'kalshi_last_attempt') is not None
+
+    cs = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.59, 0.60)]
+    def found(conn_, gd, cfg, **k):
+        bets, rows = run_decide(conn_, cs, BotConfig(markets=('WINNER',)))
+        return bets, rows, cs
+    monkeypatch.setattr(kalshi_bot, 'scan', found)
+    assert kalshi_bot.attempt(conn) == '1 new paper bets'
+    assert kalshi_bot.last_status(conn)[1] == '1 new paper bet'
+    assert kalshi_bot.attempt(conn) == '0 new paper bets'                              # never bets twice
+    assert kalshi_bot.get_meta(conn, kalshi_bot.BANKROLL_KEY) == '1000'

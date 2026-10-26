@@ -245,7 +245,12 @@ game days. Every 15 minutes from 4 pm to midnight, from cron:
 */15 16-23 * * * cd /path/to/nba-prop-bet && python3 kalshi_bot.py run --update >> kalshi.log 2>&1
 ```
 
-The app's **Kalshi bot** tab shows what the bot did: paper bankroll, record, profit and average
+**The app runs it for you:** on a game day, opening the app runs the bot in the background
+(after pulling new games, at most every 15 minutes, until 30 minutes before the last tip-off),
+and the tab has a **Run bot now** button. `NBA_KALSHI_AUTO=0` turns the automatic run off. Cron
+is only needed to catch late price moves (for CLV) when the app isn't open.
+
+The app's **Kalshi bot** tab opens on today's bets and shows what the bot did: paper bankroll, record, profit and average
 CLV, every paper bet (price, payout, model vs Kalshi, EV, CLV, result), a day-by-day summary, and
 the games it flagged today. Bets settle from the box scores in `daily_update.py`, which the app
 runs when it pulls new games (or `kalshi_bot.py settle`). The plan's gate

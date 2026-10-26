@@ -36,6 +36,7 @@ ET = ZoneInfo('America/New_York')
 FEE_RATE = 0.07
 MODE = 'PAPER'
 BANKROLL_KEY = 'kalshi_paper_bankroll'
+AUTO_MINUTES = 15          # the app runs the bot at most this often
 
 
 @dataclass
@@ -423,9 +424,10 @@ def report(conn):
 
 
 def paper_bets(conn, show='All'):
-    """Paper bets for display, newest first. show: 'All' | 'Pending' | 'Finished'. CLV (cents per
+    """Paper bets for display, newest first. show: 'Today' | 'Pending' | 'Finished' | 'All'. CLV (cents per
     contract) is our side's last pre-tip mid minus what we paid, once the game has tipped off."""
-    where = {'Pending': ' AND o.result IS NULL', 'Finished': ' AND o.result IS NOT NULL'}.get(show, '')
+    where = {'Pending': ' AND o.result IS NULL', 'Finished': ' AND o.result IS NOT NULL',
+             'Today': f" AND o.game_date = '{et_today()}'"}.get(show, '')
     o = pd.read_sql_query(
         "SELECT o.*, s.last_mid FROM kalshi_orders o LEFT JOIN kalshi_snapshots s ON s.ticker = o.ticker "
         f"WHERE o.mode = ?{where} ORDER BY o.game_date DESC, o.tip_utc, o.id", conn, params=(MODE,))
@@ -506,6 +508,54 @@ def scan(conn, game_date, cfg, client=None, use_injuries=True, allow_stale=False
     return bets, rows, contracts
 
 
+def run(conn, game_date=None, cfg=None, use_injuries=True, allow_stale=False, client=None, log=print):
+    """Scan and record: paper bets plus the price snapshots. Returns (new bets recorded, bets, rows).
+    Raises RuntimeError like scan() when an input is missing (no bets then)."""
+    cfg = cfg or BotConfig()
+    if get_meta(conn, BANKROLL_KEY) is None:
+        set_meta(conn, BANKROLL_KEY, 1000)
+    bets, rows, contracts = scan(conn, game_date or et_today(), cfg, client=client, use_injuries=use_injuries,
+                                 allow_stale=allow_stale, log=log)
+    record_snapshots(conn, contracts, rows)
+    n = record_bets(conn, bets)
+    set_status(conn, f"{n} new paper bet{'s' * (n != 1)}" if n else "no new bets")
+    return n, bets, rows
+
+
+def set_status(conn, text):
+    set_meta(conn, 'kalshi_last_status', f"{now_utc().isoformat(timespec='seconds')}|{text}")
+
+
+def last_status(conn):
+    """(when, what) the last run did, e.g. ('2026-10-26T20:15:00+00:00', '3 new paper bets'), or None."""
+    v = get_meta(conn, 'kalshi_last_status')
+    return tuple(v.split('|', 1)) if v else None
+
+
+def due(conn, now=None, cfg=None):
+    """Whether the app should run the bot now: a game today is still before the betting cutoff,
+    and the last attempt was at least AUTO_MINUTES ago."""
+    now = now or now_utc()
+    cfg = cfg or BotConfig()
+    last = get_meta(conn, 'kalshi_last_attempt')
+    if last and now - datetime.fromisoformat(last) < timedelta(minutes=AUTO_MINUTES):
+        return False
+    cutoff = (now + timedelta(minutes=cfg.cutoff_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return conn.execute("SELECT COUNT(*) FROM schedule WHERE game_date = ? AND tip_utc > ?",
+                        (now.astimezone(ET).date().isoformat(), cutoff)).fetchone()[0] > 0
+
+
+def attempt(conn):
+    """One run for the app's background job: never raises, records what happened. Returns it."""
+    set_meta(conn, 'kalshi_last_attempt', now_utc().isoformat(timespec='seconds'))
+    try:
+        return f"{run(conn, log=lambda *_: None)[0]} new paper bets"
+    except Exception as e:  # missing data, Kalshi or ESPN down: no bets, say why
+        msg = str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
+        set_status(conn, f"no bets: {msg}")
+        return f"no bets ({msg})"
+
+
 def print_rows(rows, bets, bank):
     pct = lambda v: '   -' if v is None else f"{v * 100:3.0f}%"
     print(f"\nPaper bankroll ${bank:,.2f}\n")
@@ -568,14 +618,17 @@ def main():
                     markets=tuple(m.strip().upper() for m in a.markets.split(',') if m.strip()))
     game_date = a.date or et_today()
     try:
-        bets, rows, contracts = scan(conn, game_date, cfg, use_injuries=not a.no_injuries,
-                                     allow_stale=a.allow_stale)
+        if a.command == 'run':
+            n, bets, rows = run(conn, game_date, cfg, use_injuries=not a.no_injuries, allow_stale=a.allow_stale)
+        else:
+            bets, rows, _ = scan(conn, game_date, cfg, use_injuries=not a.no_injuries, allow_stale=a.allow_stale)
     except RuntimeError as e:
+        if a.command == 'run':
+            set_status(conn, f"no bets: {e}")
         raise SystemExit(f"No bets: {e}")
     print_rows(rows, bets, bankroll(conn))
     if a.command == 'run':
-        record_snapshots(conn, contracts, rows)
-        print(f"Recorded {record_bets(conn, bets)} new paper bets")
+        print(f"Recorded {n} new paper bets")
 
 
 if __name__ == '__main__':
