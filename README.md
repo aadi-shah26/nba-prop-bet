@@ -205,13 +205,64 @@ logged props tell you whether it beats the closing market.
 and rest (projections lag sudden role changes — April is the weakest month), trades
 (opponent/team inferred from the player's latest team in the data).
 
+## Kalshi paper trading
+
+`kalshi_bot.py` is Phase 1 of [KALSHI_PLAN.md](KALSHI_PLAN.md). It reads Kalshi's live prices
+for tonight's NBA winner, spread and total contracts, prices each one with the game model
+(applying today's injury report the way the app does) and paper-bets the ones with an edge.
+**It never sends an order.** The project has no Kalshi login or order code yet, and Kalshi's
+price data is public, so no account is needed.
+
+```bash
+python kalshi_client.py              # today's Kalshi contracts, matched to the schedule
+python kalshi_bot.py scan            # what it would bet now; records nothing
+python kalshi_bot.py run --update    # refresh NBA data, then record paper bets
+python kalshi_bot.py report          # record, profit, closing-line value, model vs Kalshi Brier
+```
+
+How a contract is judged (all thresholds are flags, e.g. `--min-ev 0.03`, `--blend 0.6`):
+
+* **Probability:** half the model and half Kalshi's mid price (`--blend 0.5`), because the market
+  knows things the model doesn't. Phase 0's backtest should fit this weight.
+* **EV per contract** = that probability − the price − Kalshi's fee (7% × P × (1 − P), rounded up
+  to the cent per order). It needs at least 2¢ and a 4% return on the cost.
+* **Skipped:** bid-ask spreads wider than 4¢, prices under 5¢ or over 95¢, games within 30 minutes
+  of tip-off, and gaps of more than 15 points between model and Kalshi. Those are flagged in the
+  output to check the news, not bet.
+* **One contract per game and market.** It picks the best rung of a spread or total ladder and
+  never adds to a position on a later run.
+* **Stake:** ¼ Kelly on the paper bankroll (`--bankroll`, $1,000 to start), capped at 2% a bet,
+  3% a game and 10% a day, and no more contracts than the order book offers at that price.
+  The output shows each bet's payout multiplier (1 / price).
+* **Fails closed:** if the injury report, Kalshi's prices, an order book or last night's box scores
+  are missing, it doesn't bet (`--no-injuries` and `--allow-stale` override the first and last).
+
+Every contract it prices is kept in `kalshi_snapshots` with the first and last price seen before
+tip-off. The last one is the closing price for closing-line value (CLV), so run `run` often on
+game days. Every 15 minutes from 4 pm to midnight, from cron:
+
+```
+*/15 16-23 * * * cd /path/to/nba-prop-bet && python3 kalshi_bot.py run --update >> kalshi.log 2>&1
+```
+
+**The app runs it for you:** on a game day, opening the app runs the bot in the background
+(after pulling new games, at most every 15 minutes, until 30 minutes before the last tip-off),
+and the tab has a **Run bot now** button. `NBA_KALSHI_AUTO=0` turns the automatic run off. Cron
+is only needed to catch late price moves (for CLV) when the app isn't open.
+
+The app's **Kalshi bot** tab opens on today's bets and shows what the bot did: paper bankroll, record, profit and average
+CLV, every paper bet (price, payout, model vs Kalshi, EV, CLV, result), a day-by-day summary, and
+the games it flagged today. Bets settle from the box scores in `daily_update.py`, which the app
+runs when it pulls new games (or `kalshi_bot.py settle`). The plan's gate
+for real money is 300+ paper bets with positive average CLV.
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `app.py`, `start.command` | The web app and its Mac launcher |
 | `fetch_game_logs.py` | League-wide player + team game logs from stats.nba.com |
-| `daily_update.py` | Refresh current season, settle logged bets, recalibrate game model, refresh schedule |
+| `daily_update.py` | Refresh current season, settle logged bets and Kalshi paper bets, recalibrate game model, refresh schedule |
 | `nba_injuries.py` | Today's injury report (ESPN), used for the playing/out defaults (`NBA_INJURIES=0` turns it off) |
 | `nba_schedule.py` | Season schedule incl. upcoming games (for the Game tab's list of today's games) |
 | `feature_engineering.py` | Shared numeric core (rates, minutes, opponent factors, dispersion) |
@@ -221,6 +272,8 @@ and rest (projections lag sudden role changes — April is the weakest month), t
 | `game_model.py` | Team ratings, score/spread/total/moneyline model |
 | `odds.py` | American odds, no-vig, EV, Kelly |
 | `odds_fetcher.py` | Optional The Odds API client (game lines + player props) |
+| `kalshi_client.py` | Kalshi's public NBA prices, matched to the schedule (read-only) |
+| `kalshi_bot.py` | Kalshi paper-trading bot: EV after fees, Kelly sizing, limits, settlement, CLV |
 | `backtest.py` | Walk-forward backtests and parameter tuning |
 | `db.py`, `schema.sql` | Database, season helpers, player/team name matching |
 | `tests/` | `python -m pytest tests` |
