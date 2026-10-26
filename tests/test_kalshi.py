@@ -101,6 +101,15 @@ def test_parse_events_skips_unmatched_games():
     assert [c['team'] for c in out] == ['CHA', 'WAS']
 
 
+def test_print_contracts_lists_every_market(capsys):
+    cs = [contract('TOTAL', 'KXNBATOTAL-26OCT26WASCHA-219', 0.70, 0.71),
+          contract('SPREAD', 'KXNBASPREAD-26OCT26WASCHA-CHA2', 0.56, 0.57),
+          contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.57, 0.58)]
+    kalshi_client.print_contracts(cs)
+    lines = capsys.readouterr().out.splitlines()
+    assert ['CHA to win' in lines[0], 'CHA by over 1.5' in lines[1], 'Over 218.5' in lines[2]] == [True] * 3
+
+
 def test_orderbook_depth():
     book = parse_orderbook({'orderbook_fp': {'yes_dollars': [['0.5600', '30.00'], ['0.5700', '20.00']],
                                              'no_dollars': [['0.4100', '50.00'], ['0.4200', '10.00']]}})

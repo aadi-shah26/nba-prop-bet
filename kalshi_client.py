@@ -224,13 +224,17 @@ def main():
         return
     contracts = nba_contracts(KalshiClient(DEMO_URL if a.demo else BASE_URL), games)
     print(f"{len(contracts)} Kalshi contracts on {len(games)} games, {d}\n")
-    fmt = lambda x: '  - ' if x is None else f"{x * 100:3.0f}¢"
-    for c in sorted(contracts, key=lambda c: (c['tip_utc'] or '', c['home'], c['market'], c['line'] or 0)):
-        what = {'WINNER': f"{c['team']} wins", 'SPREAD': f"{c['team']} by over {c['line']:g}",
-                'TOTAL': f"over {c['line']:g}"}[c['market']]
-        print(f"{c['away']} @ {c['home']}  {what:<20} yes {fmt(c['yes_bid'])}/{fmt(c['yes_ask'])}  "
-              f"no {fmt(c['no_bid'])}/{fmt(c['no_ask'])}  {c['ticker']}")
+    print_contracts(contracts)
 
+
+def print_contracts(contracts):
+    """One line per contract, by tip-off, winners first, then the spread and total ladders."""
+    from kalshi_bot import describe
+    fmt = lambda x: '  - ' if x is None else f"{x * 100:3.0f}¢"
+    order = {kind: i for i, kind in enumerate(SERIES)}
+    for c in sorted(contracts, key=lambda c: (c['tip_utc'] or '', c['home'], order[c['market']], c['line'] or 0)):
+        print(f"{c['away']} @ {c['home']}  {describe(c, 'yes'):<20} yes {fmt(c['yes_bid'])}/{fmt(c['yes_ask'])}  "
+              f"no {fmt(c['no_bid'])}/{fmt(c['no_ask'])}  {c['ticker']}")
 
 if __name__ == '__main__':
     main()
