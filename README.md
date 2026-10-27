@@ -226,6 +226,12 @@ How a contract is judged (all thresholds are flags, e.g. `--min-ev 0.03`, `--ble
   knows things the model doesn't. Phase 0's backtest should fit this weight.
 * **EV per contract** = that probability − the price − Kalshi's fee (7% × P × (1 − P), rounded up
   to the cent per order). It needs at least 2¢ and a 4% return on the cost.
+* **When:** each game only between 90 and 30 minutes before its tip-off (`--window-minutes`),
+  when most injury news is out. Earlier runs still record prices, and print when betting opens.
+* **Unsettled injuries:** a game waits ("waiting on injury news") while a player who would be in
+  either team's top-8 lineup is on ESPN's report as anything but Out (Day-To-Day, Questionable).
+  The model would assume he plays. `--bet-through-injuries` bets anyway. If ESPN leaves a player
+  listed after he's cleared, the game is never bet that night.
 * **Skipped:** bid-ask spreads wider than 4¢, prices under 5¢ or over 95¢, games within 30 minutes
   of tip-off, and gaps of more than 15 points between model and Kalshi. Those are flagged in the
   output to check the news, not bet.
@@ -239,16 +245,19 @@ How a contract is judged (all thresholds are flags, e.g. `--min-ev 0.03`, `--ble
 
 Every contract it prices is kept in `kalshi_snapshots` with the first and last price seen before
 tip-off. The last one is the closing price for closing-line value (CLV), so run `run` often on
-game days. Every 15 minutes from 4 pm to midnight, from cron:
+game days. Every 15 minutes from 10 am to midnight, from cron (`--game-days-only` makes it exit
+straight away when no game today has yet to tip off; use the full path to a Python that has the
+requirements, since cron's PATH is minimal):
 
 ```
-*/15 16-23 * * * cd /path/to/nba-prop-bet && python3 kalshi_bot.py run --update >> kalshi.log 2>&1
+*/15 10-23 * * * cd /path/to/nba-prop-bet && .venv/bin/python kalshi_bot.py run --update --game-days-only >> kalshi.log 2>&1
 ```
 
 **The app runs it for you:** on a game day, opening the app runs the bot in the background
 (after pulling new games, at most every 15 minutes, until 30 minutes before the last tip-off),
 and the tab has a **Run bot now** button. `NBA_KALSHI_AUTO=0` turns the automatic run off. Cron
-is only needed to catch late price moves (for CLV) when the app isn't open.
+is what bets each game inside its window and catches late price moves (for CLV) when the app
+isn't open.
 
 The app's **Kalshi bot** tab opens on today's bets and shows what the bot did: paper bankroll, record, profit and average
 CLV, every paper bet (price, payout, model vs Kalshi, EV, CLV, result), a day-by-day summary, and
