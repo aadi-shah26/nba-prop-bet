@@ -12,8 +12,15 @@ Per contract bought at price `a` (dollars, pays $1), with the model blended towa
     stake = bankroll * min(kelly_mult * (p - c) / (1 - c), max_bet)        c = a + fee(a)
 A payout multiplier is just 1 / a: a 58-cent contract returns 1.72x if it wins.
 
+Timing: each game is only bet between window_minutes (90) and cutoff_minutes (30) before its
+tip-off, when most injury statuses are settled. Prices are still recorded on every run for
+closing-line value. A game also waits while a player who would be in either team's top
+lineup is on the injury report with any status but Out (Day-To-Day, Questionable...): the
+model would assume he plays, so the bot waits for the news instead of guessing.
+
     python kalshi_bot.py scan               # today's +EV contracts, records nothing
     python kalshi_bot.py run                # same, and records paper bets (run it every ~15 min)
+    python kalshi_bot.py run --update --game-days-only    # what cron runs: quiet when no games are left
     python kalshi_bot.py run --update       # refresh the NBA data first (like the app's update)
     python kalshi_bot.py settle             # settle finished bets (daily_update.py does this too)
     python kalshi_bot.py report             # paper record, profit, closing-line value, Brier
@@ -56,6 +63,8 @@ class BotConfig:
     min_price: float = 0.05      # skip longshots and near-certainties
     max_price: float = 0.95
     cutoff_minutes: int = 30     # no bets this close to tip-off
+    window_minutes: int = 90     # ... or earlier than this before it (injury news still coming)
+    hold_unresolved: bool = True  # wait while a top-lineup player is listed but not Out
     markets: tuple = ('WINNER', 'SPREAD', 'TOTAL')
 
 
@@ -187,16 +196,37 @@ def unloaded_past_games(conn, game_date):
                         (last, game_date)).fetchone()[0]
 
 
-def injury_outs(ctx, games):
-    """{team: [player ids listed Out]} from today's ESPN injury report, as the app applies it."""
+def injury_outs(ctx, games, rep=None):
+    """From today's ESPN injury report: ({team: [player ids listed Out]}, as the app applies it,
+    {team: [(name, status)]} for listed players not Out whose value would put them in tonight's
+    top lineup, so whether they play moves the prediction)."""
     import nba_injuries
-    rep = nba_injuries.normalize_injuries(nba_injuries.fetch_injuries())
-    out = {}
+    if rep is None:
+        rep = nba_injuries.normalize_injuries(nba_injuries.fetch_injuries())
+    out, unresolved = {}, {}
     for g in games:
         for team in (g['home'], g['away']):
-            inj = nba_injuries.match_roster(rep, ctx.roster(team), team)
+            r = ctx.roster(team)
+            inj = nba_injuries.match_roster(rep, r, team)
             out[team] = [i for i, (status, _) in inj.items() if status == nba_injuries.OUT]
-    return out
+            playing = r.loc[r['recent'] & ~r['player_id'].isin(out[team]), 'value']
+            top = playing.sort_values(ascending=False).head(ctx.params.lineup_size)
+            bar = top.min() if len(top) == ctx.params.lineup_size else -math.inf
+            names = dict(zip(r['player_id'], r['player_name']))
+            unresolved[team] = [(names[i], status) for i, (status, _) in inj.items()
+                                if status != nba_injuries.OUT and r.loc[r['player_id'] == i, 'value'].iloc[0] >= bar]
+    return out, unresolved
+
+
+def injury_holds(games, unresolved):
+    """{(home, away): why} for games waiting on a top-lineup player's status."""
+    holds = {}
+    for g in games:
+        who = [f"{name} ({team}, {status})" for team in (g['away'], g['home'])
+               for name, status in unresolved.get(team, ())]
+        if who:
+            holds[(g['home'], g['away'])] = "waiting on injury news: " + ", ".join(who)
+    return holds
 
 
 def predictions(ctx, games, outs):
@@ -249,10 +279,12 @@ def size(x, bank, room_game, room_day, depth, cfg):
     return n, f
 
 
-def decide(conn, contracts, preds, sd_margin, sd_total, cfg, game_date, now=None, orderbook=None):
+def decide(conn, contracts, preds, sd_margin, sd_total, cfg, game_date, now=None, orderbook=None, holds=None):
     """Best candidate per game and market, sized. Returns (bets, rows) where rows describes the
-    best candidate of every game-market (bet or skipped) for printing and the snapshot log."""
+    best candidate of every game-market (bet or skipped) for printing and the snapshot log.
+    holds: {(home, away): why} for games not to bet yet (injury_holds)."""
     now = now or now_utc()
+    holds = holds or {}
     bank = bankroll(conn)
     room_day = max(cfg.max_day * bank - exposure(conn, game_date), 0)
     held = held_markets(conn, game_date)
@@ -280,6 +312,13 @@ def decide(conn, contracts, preds, sd_margin, sd_total, cfg, game_date, now=None
         tip = pd.Timestamp(best['tip_utc']).to_pydatetime() if best['tip_utc'] else None
         if tip is None or now > tip - timedelta(minutes=cfg.cutoff_minutes):
             best['skip'] = 'too close to tip-off'
+            continue
+        if now < tip - timedelta(minutes=cfg.window_minutes):
+            opens = (tip - timedelta(minutes=cfg.window_minutes)).astimezone(ET)
+            best['skip'] = f"betting opens {opens:%-I:%M %p} ET".replace('AM', 'am').replace('PM', 'pm')
+            continue
+        if cfg.hold_unresolved and (home, away) in holds:
+            best['skip'] = holds[(home, away)]
             continue
         if (home, away, market) in held:
             best['skip'] = 'already holding this game and market'
@@ -487,13 +526,14 @@ def scan(conn, game_date, cfg, client=None, use_injuries=True, allow_stale=False
     ctx = GameContext(conn, game_date)
     if (w := stale_warning(ctx)) and not allow_stale:
         raise RuntimeError(w)
-    outs = {}
+    outs, holds = {}, {}
     if use_injuries:
         try:
-            outs = injury_outs(ctx, games)
+            outs, unresolved = injury_outs(ctx, games)
         except Exception as e:
             raise RuntimeError(f"Injury report unavailable ({type(e).__name__}: {e}); "
                                "use --no-injuries to bet without it") from e
+        holds = injury_holds(games, unresolved)
     preds = predictions(ctx, games, outs)
     client = client or kalshi_client.KalshiClient()
     try:
@@ -504,7 +544,8 @@ def scan(conn, game_date, cfg, client=None, use_injuries=True, allow_stale=False
 
     def book_depth(x):
         return kalshi_client.depth_at(client.orderbook(x['ticker']), x['side'], x['ask'])
-    bets, rows = decide(conn, contracts, preds, ctx.sd_margin, ctx.sd_total, cfg, game_date, orderbook=book_depth)
+    bets, rows = decide(conn, contracts, preds, ctx.sd_margin, ctx.sd_total, cfg, game_date, orderbook=book_depth,
+                        holds=holds)
     return bets, rows, contracts
 
 
@@ -518,8 +559,21 @@ def run(conn, game_date=None, cfg=None, use_injuries=True, allow_stale=False, cl
                                  allow_stale=allow_stale, log=log)
     record_snapshots(conn, contracts, rows)
     n = record_bets(conn, bets)
-    set_status(conn, f"{n} new paper bet{'s' * (n != 1)}" if n else "no new bets")
+    set_status(conn, run_summary(n, rows))
     return n, bets, rows
+
+
+def run_summary(n, rows):
+    """'1 new paper bet; waiting on injury news for WAS @ CHA; next game opens for betting 7:00 pm ET'"""
+    parts = [f"{n} new paper bet{'s' * (n != 1)}" if n else "no new bets"]
+    waiting = list(dict.fromkeys(f"{r['away']} @ {r['home']}" for r in rows
+                                 if (r['skip'] or '').startswith('waiting on injury news')))
+    if waiting:
+        parts.append("waiting on injury news for " + ", ".join(waiting))
+    opens = sorted((r['tip_utc'], r['skip']) for r in rows if (r['skip'] or '').startswith('betting opens'))
+    if opens:
+        parts.append("next game " + opens[0][1].replace('betting opens', 'opens for betting'))
+    return "; ".join(parts)
 
 
 def set_status(conn, text):
@@ -540,9 +594,15 @@ def due(conn, now=None, cfg=None):
     last = get_meta(conn, 'kalshi_last_attempt')
     if last and now - datetime.fromisoformat(last) < timedelta(minutes=AUTO_MINUTES):
         return False
-    cutoff = (now + timedelta(minutes=cfg.cutoff_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return games_left(conn, now, cfg.cutoff_minutes) > 0
+
+
+def games_left(conn, now=None, minutes=0):
+    """Today's games (US Eastern) tipping off more than `minutes` from now."""
+    now = now or now_utc()
+    after = (now + timedelta(minutes=minutes)).strftime('%Y-%m-%dT%H:%M:%SZ')
     return conn.execute("SELECT COUNT(*) FROM schedule WHERE game_date = ? AND tip_utc > ?",
-                        (now.astimezone(ET).date().isoformat(), cutoff)).fetchone()[0] > 0
+                        (now.astimezone(ET).date().isoformat(), after)).fetchone()[0]
 
 
 def attempt(conn):
@@ -582,6 +642,12 @@ def main():
     ap.add_argument('--update', action='store_true', help='refresh NBA data before scanning')
     ap.add_argument('--no-injuries', action='store_true', help="don't apply ESPN's injury report")
     ap.add_argument('--allow-stale', action='store_true', help='bet even if the model data is behind')
+    ap.add_argument('--window-minutes', type=int, default=BotConfig.window_minutes,
+                    help='bet a game only this many minutes before tip-off or later (default 90)')
+    ap.add_argument('--bet-through-injuries', action='store_true',
+                    help="don't wait on top-lineup players listed Day-To-Day/Questionable (assume they play)")
+    ap.add_argument('--game-days-only', action='store_true',
+                    help='exit quietly unless a game today has yet to tip off (for cron)')
     for f in fields(BotConfig):
         if f.type is float:
             ap.add_argument('--' + f.name.replace('_', '-'), type=float, default=f.default)
@@ -611,11 +677,14 @@ def main():
                   f"Kalshi {r['brier_kalshi']:.4f} (lower is better)")
         return
 
+    if a.game_days_only and not a.date and not games_left(conn):
+        return
     if a.update:
         from daily_update import update
         update(conn, quick=True)
     cfg = BotConfig(**{f.name: getattr(a, f.name) for f in fields(BotConfig) if f.type is float},
-                    markets=tuple(m.strip().upper() for m in a.markets.split(',') if m.strip()))
+                    markets=tuple(m.strip().upper() for m in a.markets.split(',') if m.strip()),
+                    window_minutes=a.window_minutes, hold_unresolved=not a.bet_through_injuries)
     game_date = a.date or et_today()
     try:
         if a.command == 'run':

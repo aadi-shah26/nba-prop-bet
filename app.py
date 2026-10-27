@@ -1249,8 +1249,9 @@ with tab_kalshi:
 
     c1, c2 = st.columns([4, 1], vertical_alignment="center")
     c1.caption("Paper trades only: no money moves. On game days, opening the app runs the bot by itself (at "
-               "most every 15 minutes, until 30 minutes before the last tip-off). It buys before games start "
-               "and holds to the final score. Bets settle when the app pulls new games.")
+               "most every 15 minutes, until 30 minutes before the last tip-off). It bets each game only between 90 "
+               "and 30 minutes before its tip-off, and waits while a key player is listed Day-To-Day or "
+               "Questionable. It holds to the final score. Bets settle when the app pulls new games.")
     running = background.status()['running']
     if c2.button("Run bot now", key="kalshi_run", icon=":material/play_arrow:", width="stretch", disabled=running,
                  help="Price today's Kalshi contracts and record any new paper bets"):

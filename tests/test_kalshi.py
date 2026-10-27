@@ -13,6 +13,7 @@ from tests.conftest import make_league
 
 GAME = {'game_date': '2026-10-26', 'home': 'CHA', 'away': 'WAS', 'tip_utc': '2026-10-26T23:00:00Z'}
 NOON = datetime(2026, 10, 26, 16, 0, tzinfo=timezone.utc)
+BET_TIME = datetime(2026, 10, 26, 22, 0, tzinfo=timezone.utc)        # 60 min before tip: inside the window
 PRED = {'p_home_win': 0.70, 'margin': 7.0, 'total': 225.0}
 
 
@@ -142,9 +143,9 @@ def bank(conn, amount=1000):
     kalshi_bot.set_meta(conn, kalshi_bot.BANKROLL_KEY, amount)
 
 
-def run_decide(conn, contracts, cfg=None, preds=None, now=NOON, depth=1000):
+def run_decide(conn, contracts, cfg=None, preds=None, now=BET_TIME, depth=1000, holds=None):
     return decide(conn, contracts, preds or {('CHA', 'WAS'): PRED}, 12.9, 19.0, cfg or BotConfig(),
-                  '2026-10-26', now=now, orderbook=None if depth is None else (lambda x: depth))
+                  '2026-10-26', now=now, orderbook=None if depth is None else (lambda x: depth), holds=holds)
 
 
 def test_bets_the_edge_and_sizes_by_kelly(conn):
@@ -210,6 +211,59 @@ def test_wide_spread_and_tip_off_are_skipped(conn):
     late = datetime(2026, 10, 26, 22, 45, tzinfo=timezone.utc)                # 15 min before tip
     bets, rows = run_decide(conn, ok, now=late)
     assert bets == [] and rows[0]['skip'] == 'too close to tip-off'
+
+
+def test_only_bets_inside_the_window_before_tip_off(conn):
+    bank(conn)
+    ok = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.59, 0.60)]
+    bets, rows = run_decide(conn, ok, now=NOON)                               # 7 hours early
+    assert bets == [] and rows[0]['skip'] == 'betting opens 5:30 pm ET'
+    assert len(run_decide(conn, ok, now=datetime(2026, 10, 26, 21, 30, tzinfo=timezone.utc))[0]) == 1
+    assert len(run_decide(conn, ok, BotConfig(window_minutes=600), now=NOON)[0]) == 1
+
+
+def test_waits_on_unresolved_injuries(conn):
+    bank(conn)
+    ok = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.59, 0.60)]
+    holds = {('CHA', 'WAS'): 'waiting on injury news: LaMelo Ball (CHA, Day-To-Day)'}
+    bets, rows = run_decide(conn, ok, holds=holds)
+    assert bets == [] and rows[0]['skip'] == holds[('CHA', 'WAS')]
+    assert len(run_decide(conn, ok, holds={('BOS', 'LAL'): 'x'})[0]) == 1                # another game
+    assert len(run_decide(conn, ok, BotConfig(hold_unresolved=False), holds=holds)[0]) == 1
+
+
+def test_injury_outs_and_holds():
+    import pandas as pd
+    from types import SimpleNamespace
+    rosters = {
+        'CHA': pd.DataFrame({'player_id': [1, 2, 3, 4], 'player_name': ['Star', 'Second', 'Bench', 'Returning'],
+                             'value': [20.0, 12.0, 4.0, 15.0], 'recent': [True, True, True, False]}),
+        'WAS': pd.DataFrame({'player_id': [5, 6, 7], 'player_name': ['A', 'B', 'C'],
+                             'value': [10.0, 8.0, 6.0], 'recent': [True, True, True]}),
+    }
+    ctx = SimpleNamespace(roster=lambda t: rosters[t], params=SimpleNamespace(lineup_size=2))
+    rep = pd.DataFrame([('CHA', 'Star', 'Out', '', None), ('CHA', 'Bench', 'Day-To-Day', '', None),
+                        ('CHA', 'Returning', 'Day-To-Day', '', None), ('WAS', 'C', 'Questionable', '', None)],
+                       columns=['team', 'player_name', 'status', 'comment', 'return_date'])
+    games = [{'home': 'CHA', 'away': 'WAS'}]
+    outs, unresolved = kalshi_bot.injury_outs(ctx, games, rep)
+    assert outs == {'CHA': [1], 'WAS': []}
+    # with Star out CHA's top two are Second (12) and Bench (4): Bench's status matters, and so does
+    # Returning (15), who would be in it if he plays. WAS's C (6) is outside A and B either way.
+    assert unresolved == {'CHA': [('Bench', 'Day-To-Day'), ('Returning', 'Day-To-Day')], 'WAS': []}
+    assert kalshi_bot.injury_holds(games, unresolved) == {
+        ('CHA', 'WAS'): 'waiting on injury news: Bench (CHA, Day-To-Day), Returning (CHA, Day-To-Day)'}
+    assert kalshi_bot.injury_holds(games, {'CHA': [], 'WAS': []}) == {}
+
+
+def test_run_summary():
+    rows = [{'away': 'WAS', 'home': 'CHA', 'tip_utc': '2026-10-26T23:00:00Z', 'skip': 'waiting on injury news: x'},
+            {'away': 'WAS', 'home': 'CHA', 'tip_utc': '2026-10-26T23:00:00Z', 'skip': 'waiting on injury news: x'},
+            {'away': 'LAL', 'home': 'BOS', 'tip_utc': '2026-10-27T03:00:00Z', 'skip': 'betting opens 9:30 pm ET'},
+            {'away': 'NYK', 'home': 'MIA', 'tip_utc': '2026-10-27T00:00:00Z', 'skip': 'betting opens 6:30 pm ET'}]
+    assert kalshi_bot.run_summary(1, rows) == ("1 new paper bet; waiting on injury news for WAS @ CHA; "
+                                               "next game opens for betting 6:30 pm ET")
+    assert kalshi_bot.run_summary(0, []) == "no new bets"
 
 
 def test_one_bet_per_game_market_and_caps(conn):
@@ -358,7 +412,7 @@ def test_scan_end_to_end(conn):
     fake = FakeKalshi(events)
     client = kalshi_client.KalshiClient(session=fake)
     cfg = BotConfig(markets=('WINNER',))
-    now = datetime(2026, 1, 10, 17, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 10, 23, 30, tzinfo=timezone.utc)                # an hour before tip-off
     orig = kalshi_bot.now_utc
     kalshi_bot.now_utc = lambda: now
     try:
@@ -420,6 +474,8 @@ def test_due_only_before_the_last_cutoff_and_not_too_often(conn):
     kalshi_bot.set_meta(conn, 'kalshi_last_attempt', '2026-10-26T15:50:00+00:00')
     assert not kalshi_bot.due(conn, now=NOON)                                           # tried 10 min ago
     assert kalshi_bot.due(conn, now=datetime(2026, 10, 26, 16, 6, tzinfo=timezone.utc))
+    assert kalshi_bot.games_left(conn, now=datetime(2026, 10, 26, 22, 45, tzinfo=timezone.utc)) == 1   # cron: until tip
+    assert kalshi_bot.games_left(conn, now=datetime(2026, 10, 26, 23, 0, tzinfo=timezone.utc)) == 0
 
 
 def test_attempt_records_why_there_are_no_bets(conn, monkeypatch):
