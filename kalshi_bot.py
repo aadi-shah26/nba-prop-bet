@@ -15,8 +15,9 @@ A payout multiplier is just 1 / a: a 58-cent contract returns 1.72x if it wins.
 Timing: each game is only bet between window_minutes (90) and cutoff_minutes (30) before its
 tip-off, when most injury statuses are settled. Prices are still recorded on every run for
 closing-line value. A game also waits while a player who would be in either team's top
-lineup is on the injury report with any status but Out (Day-To-Day, Questionable...): the
-model would assume he plays, so the bot waits for the news instead of guessing.
+lineup is listed Questionable or Doubtful: the model would assume he plays, so the bot waits
+for the news instead of guessing. Day-To-Day doesn't hold a game: ESPN rarely updates it
+before tip-off, those players usually play, and the model already assumes they do.
 
     python kalshi_bot.py scan               # today's +EV contracts, records nothing
     python kalshi_bot.py run                # same, and records paper bets (run it every ~15 min)
@@ -27,6 +28,7 @@ model would assume he plays, so the bot waits for the news instead of guessing.
 """
 
 import argparse
+import json
 import math
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -43,6 +45,7 @@ ET = ZoneInfo('America/New_York')
 FEE_RATE = 0.07
 MODE = 'PAPER'
 BANKROLL_KEY = 'kalshi_paper_bankroll'
+HOLD_STATUSES = ('Questionable', 'Doubtful')   # injury statuses a game waits on
 AUTO_MINUTES = 15          # the app runs the bot at most this often
 
 
@@ -64,12 +67,20 @@ class BotConfig:
     max_price: float = 0.95
     cutoff_minutes: int = 30     # no bets this close to tip-off
     window_minutes: int = 90     # ... or earlier than this before it (injury news still coming)
-    hold_unresolved: bool = True  # wait while a top-lineup player is listed but not Out
+    hold_unresolved: bool = True  # wait while a top-lineup player is Questionable or Doubtful
     markets: tuple = ('WINNER', 'SPREAD', 'TOTAL')
 
 
 def et_today():
     return datetime.now(ET).date().isoformat()
+
+
+def et_clock(iso):
+    """'7:30 pm' (US Eastern) for a UTC ISO time, or None."""
+    if not iso:
+        return None
+    t = pd.Timestamp(iso).tz_convert(ET)
+    return f"{t.hour % 12 or 12}:{t:%M} {'am' if t.hour < 12 else 'pm'}"
 
 
 def now_utc():
@@ -198,7 +209,7 @@ def unloaded_past_games(conn, game_date):
 
 def injury_outs(ctx, games, rep=None):
     """From today's ESPN injury report: ({team: [player ids listed Out]}, as the app applies it,
-    {team: [(name, status)]} for listed players not Out whose value would put them in tonight's
+    {team: [(name, status)]} for players listed Questionable or Doubtful whose value would put them in tonight's
     top lineup, so whether they play moves the prediction)."""
     import nba_injuries
     if rep is None:
@@ -214,7 +225,7 @@ def injury_outs(ctx, games, rep=None):
             bar = top.min() if len(top) == ctx.params.lineup_size else -math.inf
             names = dict(zip(r['player_id'], r['player_name']))
             unresolved[team] = [(names[i], status) for i, (status, _) in inj.items()
-                                if status != nba_injuries.OUT and r.loc[r['player_id'] == i, 'value'].iloc[0] >= bar]
+                                if status in HOLD_STATUSES and r.loc[r['player_id'] == i, 'value'].iloc[0] >= bar]
     return out, unresolved
 
 
@@ -307,6 +318,7 @@ def decide(conn, contracts, preds, sd_margin, sd_total, cfg, game_date, now=None
         best = max(ok or [x for x in xs if x['ev'] is not None] or xs,
                    key=lambda x: -1 if x['ev'] is None else x['ev'])
         rows.append(best)
+        best['hold'] = holds.get((home, away))
         if not ok:
             continue
         tip = pd.Timestamp(best['tip_utc']).to_pydatetime() if best['tip_utc'] else None
@@ -473,7 +485,8 @@ def paper_bets(conn, show='All'):
     close = o['last_mid'].where(o['side'] == 'yes', 1 - o['last_mid'])
     started = pd.to_datetime(o['tip_utc'], utc=True) <= now_utc()
     return pd.DataFrame({
-        'Date': pd.to_datetime(o['game_date']).dt.strftime('%b %-d'), 'Game': o['away'] + ' @ ' + o['home'],
+        'Date': pd.to_datetime(o['game_date']).dt.strftime('%b %-d'), 'Tip-off': o['tip_utc'].map(et_clock),
+        'Game': o['away'] + ' @ ' + o['home'],
         'Bet': o['description'],
         'Price': o['price'] * 100, 'Pays': 1 / o['price'], 'Qty': o['count'], 'Cost': o['cost'],
         'Model %': o['p_model'] * 100, 'Kalshi %': o['p_market'] * 100, 'EV': o['ev'] * 100,
@@ -560,7 +573,75 @@ def run(conn, game_date=None, cfg=None, use_injuries=True, allow_stale=False, cl
     record_snapshots(conn, contracts, rows)
     n = record_bets(conn, bets)
     set_status(conn, run_summary(n, rows))
+    save_outlook(conn, game_date or et_today(), game_reasons(rows))
     return n, bets, rows
+
+
+BET_PLACED = ('Bet placed', '')
+
+
+def past_cutoff(hold):
+    if hold:
+        return 'Missed the cutoff', f"Had an edge, but waited on injury news for {hold} until 30 minutes before tip-off"
+    return 'Missed the cutoff', "Had an edge, but only once it was within 30 minutes of tip-off"
+
+
+def game_reason(rows):
+    """(status, details) for one game from its game-markets' rows in the last run, e.g.
+    ('Opens 9:30 pm ET', 'Edge on 2 of 3 markets'), or BET_PLACED."""
+    if any(r['skip'] is None for r in rows):
+        return BET_PLACED
+    skips = [r['skip'] or '' for r in rows]
+    first = lambda prefix: next((s for s in skips if s.startswith(prefix)), None)
+    hold = (rows[0].get('hold') or '').removeprefix('waiting on injury news: ')
+    if first('already holding'):
+        return BET_PLACED
+    if s := first('betting opens'):
+        n = sum(s.startswith('betting opens') for s in skips)
+        return (s.replace('betting opens', 'Opens'),
+                f"Edge on {n} of {len(rows)} markets" + (f"; waiting on injury news: {hold}" if hold else ""))
+    if first('waiting on injury news'):
+        return 'Waiting on injury news', f"{hold}. Bets once the status is settled"
+    if first('too close'):
+        return past_cutoff(hold)
+    if first('FLAG'):
+        status, details = 'Flagged', "Model and Kalshi disagree too much to bet; check the news"
+    elif first('EV'):
+        status, details = 'No edge', "Kalshi's prices are close to the model's"
+    else:
+        status, details = 'Skipped', skips[0][:1].upper() + skips[0][1:]
+    return status, details + (f"; also waiting on injury news: {hold}" if hold else "")
+
+
+def game_reasons(rows):
+    """[{game, tip_utc, status, details, hold}] per game in tip-off order (see game_reason)."""
+    games = {}
+    for r in rows:
+        games.setdefault((r['tip_utc'] or '', r['away'] + ' @ ' + r['home']), []).append(r)
+    return [{'game': g, 'tip_utc': tip or None, **dict(zip(('status', 'details'), game_reason(rs))),
+             'hold': (rs[0].get('hold') or '').removeprefix('waiting on injury news: ')}
+            for (tip, g), rs in sorted(games.items())]
+
+
+def save_outlook(conn, game_date, games):
+    """Store this run's game_reasons. A game past the cutoff keeps the injury wait that held it through its
+    window: ESPN often drops a player's status once the game starts, which would hide why it wasn't bet."""
+    prev = {g['game']: g.get('hold') for g in outlook(conn, game_date)[1]}
+    for g in games:
+        if (g['status'], g['details']) == past_cutoff('') and prev.get(g['game']):
+            g.update(hold=prev[g['game']], details=past_cutoff(prev[g['game']])[1])
+    set_meta(conn, 'kalshi_outlook', json.dumps({'date': game_date, 'games': games}))
+
+
+def outlook(conn, game_date):
+    """(paper bets on game_date, the last run's game_reasons for it or []), with games bet today as BET_PLACED."""
+    n = conn.execute("SELECT COUNT(*) FROM kalshi_orders WHERE mode = ? AND game_date = ?",
+                     (MODE, game_date)).fetchone()[0]
+    v = json.loads(get_meta(conn, 'kalshi_outlook') or '{}')
+    bet = {r[0] for r in conn.execute("SELECT DISTINCT away || ' @ ' || home FROM kalshi_orders "
+                                      "WHERE mode = ? AND game_date = ?", (MODE, game_date))}
+    games = [g for g in v.get('games', []) if 'status' in g] if v.get('date') == game_date else []
+    return n, [{**g, **dict(zip(('status', 'details'), BET_PLACED))} if g['game'] in bet else g for g in games]
 
 
 def run_summary(n, rows):
@@ -645,7 +726,7 @@ def main():
     ap.add_argument('--window-minutes', type=int, default=BotConfig.window_minutes,
                     help='bet a game only this many minutes before tip-off or later (default 90)')
     ap.add_argument('--bet-through-injuries', action='store_true',
-                    help="don't wait on top-lineup players listed Day-To-Day/Questionable (assume they play)")
+                    help="don't wait on top-lineup players listed Questionable/Doubtful (assume they play)")
     ap.add_argument('--game-days-only', action='store_true',
                     help='exit quietly unless a game today has yet to tip off (for cron)')
     for f in fields(BotConfig):
