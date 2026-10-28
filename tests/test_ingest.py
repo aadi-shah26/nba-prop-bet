@@ -89,3 +89,17 @@ def test_find_players(league_conn):
     assert find_players(league_conn, 'bos player0')['player_name'].tolist() == ['BOS Player0']
     assert len(find_players(league_conn, 'player0')) == 6
     assert len(find_players(league_conn, 'player0', teams=['LAL'])) == 1
+
+
+def test_game_in_progress_skipped(conn):
+    """The feed lists live games with partial stats and no W/L; they must not be stored."""
+    p, t = make_league(seasons=(2025,))[2025]
+    g = t['GAME_ID'].iloc[0]
+    t = t.copy()
+    t.loc[t['GAME_ID'] == g, 'WL'] = None
+    msgs = []
+    n_p, n_t = ingest_frames(conn, 2025, 'Regular Season', p, t, log=msgs.append)
+    assert n_t == len(t) - 2
+    assert n_p == len(p) - (p['GAME_ID'] == g).sum()
+    assert conn.execute("SELECT COUNT(*) FROM player_games WHERE game_id = ?", (g,)).fetchone()[0] == 0
+    assert any('still in progress' in m for m in msgs)

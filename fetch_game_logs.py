@@ -143,6 +143,13 @@ def ingest_frames(conn, season, season_type, player_raw, team_raw, log=print):
     """
     p = normalize_player_frame(player_raw, season, season_type)
     t = normalize_team_frame(team_raw, season, season_type)
+    # The feed lists games that are still being played, with partial stats and no W/L yet;
+    # storing them would settle bets off a live score.
+    live = t.loc[t['wl'].isna(), 'game_id'].unique()
+    if len(live):
+        log(f"ℹ️ {season_str(season)} {season_type}: skipped {len(live)} game(s) still in progress")
+        t = t[~t['game_id'].isin(live)]
+        p = p[~p['game_id'].isin(live)]
     if not t.empty:
         per_game = t.groupby('game_id')['home'].agg(['size', 'sum'])
         incomplete = per_game.index[per_game['size'] != 2]
