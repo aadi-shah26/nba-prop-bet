@@ -20,12 +20,15 @@ def test_finished_games_missing(league_conn):
     last = league_conn.execute("SELECT MAX(game_date) FROM team_games").fetchone()[0]
     after = (date.fromisoformat(last) + timedelta(days=1)).isoformat()
     now = datetime(2030, 1, 1, tzinfo=timezone.utc)
-    _schedule(league_conn, last, f'{last}T23:00:00Z', 'Final', 'a')            # already loaded
+    loaded = league_conn.execute("SELECT game_id FROM team_games WHERE game_date = ?", (last,)).fetchone()[0]
+    _schedule(league_conn, last, f'{last}T23:00:00Z', 'Final', loaded)         # already loaded
     _schedule(league_conn, after, f'{after}T23:00:00Z', gid='b')               # finished, not loaded
     _schedule(league_conn, after, f'{after}T23:00:00Z', 'PPD', 'c')            # postponed: never comes
     assert finished_games_missing(league_conn, now) == 1
     just_tipped = datetime.fromisoformat(f'{after}T23:30:00+00:00')
     assert finished_games_missing(league_conn, just_tipped) == 0               # still being played
+    _schedule(league_conn, last, f'{last}T23:00:00Z', 'Final', 'late')         # live at the last load
+    assert finished_games_missing(league_conn, now) == 2
 
 
 def test_update_due(league_conn, monkeypatch):

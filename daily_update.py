@@ -39,8 +39,12 @@ def finished_games_missing(conn, now=None):
     if last is None:
         return 0
     cutoff = ((now or datetime.now(timezone.utc)) - timedelta(hours=GAME_HOURS)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    return conn.execute("SELECT COUNT(*) FROM schedule WHERE game_date > ? AND tip_utc <= ? "
-                        "AND status NOT LIKE '%PPD%' AND status NOT LIKE '%ostpone%'", (last, cutoff)).fetchone()[0]
+    # by game_id, not just date: a late game still live at the last load shares its date with
+    # the games that did load
+    return conn.execute("SELECT COUNT(*) FROM schedule s WHERE game_date >= ? AND tip_utc <= ? "
+                        "AND status NOT LIKE '%PPD%' AND status NOT LIKE '%ostpone%' "
+                        "AND NOT EXISTS (SELECT 1 FROM team_games t WHERE t.game_id = s.game_id)",
+                        (last, cutoff)).fetchone()[0]
 
 
 def roster_age_hours(conn, season):
