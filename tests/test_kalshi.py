@@ -242,17 +242,19 @@ def test_injury_outs_and_holds():
                              'value': [10.0, 8.0, 6.0], 'recent': [True, True, True]}),
     }
     ctx = SimpleNamespace(roster=lambda t: rosters[t], params=SimpleNamespace(lineup_size=2))
-    rep = pd.DataFrame([('CHA', 'Star', 'Out', '', None), ('CHA', 'Bench', 'Day-To-Day', '', None),
-                        ('CHA', 'Returning', 'Day-To-Day', '', None), ('WAS', 'C', 'Questionable', '', None)],
+    rep = pd.DataFrame([('CHA', 'Star', 'Out', '', None), ('CHA', 'Bench', 'Questionable', '', None),
+                        ('CHA', 'Returning', 'Doubtful', '', None), ('CHA', 'Second', 'Day-To-Day', '', None),
+                        ('WAS', 'C', 'Questionable', '', None)],
                        columns=['team', 'player_name', 'status', 'comment', 'return_date'])
     games = [{'home': 'CHA', 'away': 'WAS'}]
     outs, unresolved = kalshi_bot.injury_outs(ctx, games, rep)
     assert outs == {'CHA': [1], 'WAS': []}
     # with Star out CHA's top two are Second (12) and Bench (4): Bench's status matters, and so does
-    # Returning (15), who would be in it if he plays. WAS's C (6) is outside A and B either way.
-    assert unresolved == {'CHA': [('Bench', 'Day-To-Day'), ('Returning', 'Day-To-Day')], 'WAS': []}
+    # Returning (15), who would be in it if he plays. Second is only Day-To-Day, which doesn't hold a
+    # game. WAS's C (6) is outside A and B either way.
+    assert unresolved == {'CHA': [('Bench', 'Questionable'), ('Returning', 'Doubtful')], 'WAS': []}
     assert kalshi_bot.injury_holds(games, unresolved) == {
-        ('CHA', 'WAS'): 'waiting on injury news: Bench (CHA, Day-To-Day), Returning (CHA, Day-To-Day)'}
+        ('CHA', 'WAS'): 'waiting on injury news: Bench (CHA, Questionable), Returning (CHA, Doubtful)'}
     assert kalshi_bot.injury_holds(games, {'CHA': [], 'WAS': []}) == {}
 
 
@@ -264,6 +266,51 @@ def test_run_summary():
     assert kalshi_bot.run_summary(1, rows) == ("1 new paper bet; waiting on injury news for WAS @ CHA; "
                                                "next game opens for betting 6:30 pm ET")
     assert kalshi_bot.run_summary(0, []) == "no new bets"
+
+
+def test_game_reasons_explain_each_game():
+    r = lambda game, skip, hold=None, tip='2026-10-26T23:00:00Z': {
+        'away': game[:3], 'home': game[-3:], 'tip_utc': tip, 'skip': skip, 'hold': hold}
+    hold = 'waiting on injury news: Derrick White (BOS, Day-To-Day)'
+    rows = [r('LAL @ BOS', 'betting opens 5:30 pm ET', hold), r('LAL @ BOS', 'EV +0.4¢ (+0.8%) below the minimum', hold),
+            r('NYK @ MIA', hold, hold, tip='2026-10-26T22:00:00Z'),
+            r('WAS @ CHA', 'EV -1.0¢ (-2.0%) below the minimum', tip='2026-10-27T01:00:00Z'),
+            r('DEN @ PHX', None, tip='2026-10-27T02:00:00Z'),
+            r('SAC @ SAS', 'FLAG: model and Kalshi differ by 22%, check news', tip='2026-10-27T02:00:00Z')]
+    assert [(g['game'], g['status'], g['details']) for g in kalshi_bot.game_reasons(rows)] == [
+        ('NYK @ MIA', 'Waiting on injury news', 'Derrick White (BOS, Day-To-Day). Bets once the status is settled'),
+        ('LAL @ BOS', 'Opens 5:30 pm ET', 'Edge on 1 of 2 markets; waiting on injury news: Derrick White (BOS, Day-To-Day)'),
+        ('WAS @ CHA', 'No edge', "Kalshi's prices are close to the model's"),
+        ('DEN @ PHX', 'Bet placed', ''),
+        ('SAC @ SAS', 'Flagged', 'Model and Kalshi disagree too much to bet; check the news')]
+    assert kalshi_bot.game_reasons(rows)[0]['tip_utc'] == '2026-10-26T22:00:00Z'
+
+
+def test_run_saves_the_outlook_for_the_day(conn, monkeypatch):
+    bank(conn)
+    cs = [contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.59, 0.60)]
+    holds = {('CHA', 'WAS'): 'waiting on injury news: LaMelo Ball (CHA, Day-To-Day)'}
+    monkeypatch.setattr(kalshi_bot, 'scan', lambda conn_, gd, cfg, **k: (*run_decide(conn_, cs, holds=holds), cs))
+    kalshi_bot.run(conn, '2026-10-26')
+    n, games = kalshi_bot.outlook(conn, '2026-10-26')
+    assert n == 0 and [g['game'] for g in games] == ['WAS @ CHA'] and 'LaMelo Ball' in games[0]['details']
+    assert kalshi_bot.outlook(conn, '2026-10-27') == (0, [])                           # another day: nothing stale
+
+    # at the cutoff ESPN no longer lists the player: the reason still names the injury wait that held it
+    late = datetime(2026, 10, 26, 22, 45, tzinfo=timezone.utc)
+    monkeypatch.setattr(kalshi_bot, 'scan', lambda conn_, gd, cfg, **k: (*run_decide(conn_, cs, now=late), cs))
+    kalshi_bot.run(conn, '2026-10-26')
+    g = kalshi_bot.outlook(conn, '2026-10-26')[1][0]
+    assert (g['status'], g['details']) == (
+        'Missed the cutoff', 'Had an edge, but waited on injury news for LaMelo Ball (CHA, Day-To-Day) until 30 '
+        'minutes before tip-off')
+
+    # a game bet on an earlier run reads as bet even when the latest run skipped it
+    monkeypatch.setattr(kalshi_bot, 'scan', lambda conn_, gd, cfg, **k: (*run_decide(conn_, cs), cs))
+    kalshi_bot.run(conn, '2026-10-26')
+    kalshi_bot.run(conn, '2026-10-26')
+    assert kalshi_bot.outlook(conn, '2026-10-26') == (1, [{'game': 'WAS @ CHA', 'tip_utc': cs[0]['tip_utc'],
+                                                           'status': 'Bet placed', 'details': '', 'hold': ''}])
 
 
 def test_one_bet_per_game_market_and_caps(conn):
@@ -455,6 +502,7 @@ def test_summary_helpers(conn, monkeypatch):
     monkeypatch.setattr(kalshi_bot, 'now_utc', lambda: NOON)                    # before tip: no CLV yet
     b = kalshi_bot.paper_bets(conn)
     assert list(b['Bet']) == ['CHA to win'] and b['CLV'].isna().all() and list(b['Result']) == ['Pending']
+    assert list(b['Tip-off']) == ['7:00 pm']
     assert b['Pays'].iloc[0] == pytest.approx(1 / 0.60)
     assert kalshi_bot.paper_bets(conn, 'Finished').empty
     add_final(conn, 110, 100)

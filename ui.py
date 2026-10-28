@@ -38,6 +38,14 @@ CSS = """
   --pos: #15803D; --pos-soft: #E8F6EC; --neg: #B91C1C; --neg-soft: #FCECEC;
   --warn: #B45309; --warn-soft: #FEF5E7; --flat: #475569; --flat-soft: #F1F5F9;
 }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #E2E8F0; --muted: #94A3B8; --line: #263142; --card: #141A25;
+    --accent: #7AA2FF; --accent-soft: #1A2440;
+    --pos: #4CC27A; --pos-soft: #13261B; --neg: #F07A7A; --neg-soft: #2B1719;
+    --warn: #F0A43A; --warn-soft: #2A2113; --flat: #A5B0C2; --flat-soft: #1D2533;
+  }
+}
 .block-container { padding-top: 2.2rem; max-width: 1280px; }
 h1, h2, h3, h4 { letter-spacing: -0.01em; }
 .num { font-variant-numeric: tabular-nums; }
@@ -110,7 +118,7 @@ div[data-testid="stMetricValue"] { font-weight: 650; }
 table.trk { width: 100%; border-collapse: collapse; font-size: .88rem; }
 table.trk th { text-align: left; font-weight: 600; color: var(--muted); font-size: .74rem;
   text-transform: uppercase; letter-spacing: .05em; padding: .6rem .75rem; border-bottom: 1px solid var(--line);
-  background: #FAFBFC; white-space: nowrap; }
+  background: var(--flat-soft); white-space: nowrap; }
 table.trk td { padding: .55rem .75rem; border-bottom: 1px solid var(--line); color: var(--ink);
   vertical-align: middle; white-space: nowrap; }
 table.trk tr:last-child td { border-bottom: none; }
@@ -123,6 +131,52 @@ table.trk .sub { color: var(--muted); font-size: .78rem; }
 .pos-txt { color: var(--pos); font-weight: 600; }
 .neg-txt { color: var(--neg); font-weight: 600; }
 .dim { color: #94A3B8; }
+
+/* section cards (st.container(border=True)) */
+div[data-testid="stVerticalBlockBorderWrapper"]:has(> div > div[data-testid="stVerticalBlock"]) {
+  background: var(--card); border-radius: 12px; }
+.sec-title { font-size: 1.05rem; font-weight: 700; color: var(--ink); margin: 0 0 .1rem; }
+.sec-sub { color: var(--muted); font-size: .85rem; margin-bottom: .4rem; }
+
+/* bot status bar */
+.botbar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; background: var(--card);
+  border: 1px solid var(--line); border-radius: 10px; padding: .6rem .9rem; margin: .2rem 0 .6rem;
+  color: var(--ink); font-size: .9rem; }
+.botbar .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pos); flex: none;
+  box-shadow: 0 0 0 3px var(--pos-soft); }
+.botbar .dot.off { background: var(--neg); box-shadow: 0 0 0 3px var(--neg-soft); }
+.botbar .sep { color: var(--muted); }
+.botbar .muted { color: var(--muted); }
+
+/* today's game cards */
+.gcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: .75rem;
+  margin: .2rem 0 .4rem; }
+.gcard { background: var(--card); border: 1px solid var(--line); border-top: 3px solid var(--flat);
+  border-radius: 12px; padding: .8rem .95rem; display: flex; flex-direction: column; gap: .55rem; }
+.gcard.pos { border-top-color: var(--pos); } .gcard.warn { border-top-color: var(--warn); }
+.gcard.accent { border-top-color: var(--accent); } .gcard.neg { border-top-color: var(--neg); }
+.gcard .top { display: flex; justify-content: space-between; align-items: center; gap: .5rem; }
+.gcard .time { color: var(--muted); font-size: .8rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.gcard .teams { display: flex; align-items: center; gap: .55rem; font-weight: 700; color: var(--ink);
+  font-size: 1.02rem; }
+.gcard .teams .at { color: var(--muted); font-weight: 500; font-size: .85rem; }
+.gcard .details { color: var(--muted); font-size: .84rem; line-height: 1.35; }
+.gcard .bet { display: flex; justify-content: space-between; gap: .5rem; font-size: .86rem; color: var(--ink);
+  border-top: 1px dashed var(--line); padding-top: .45rem; }
+.gcard .bet + .bet { border-top: none; padding-top: 0; }
+.gcard .bet .n { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* phones */
+@media (max-width: 640px) {
+  .block-container { padding: 1.2rem 1rem 2rem; }
+  .app-head h1 { font-size: 1.3rem; }
+  .matchup { padding: .9rem; }
+  .matchup .row { gap: .5rem; }
+  .matchup .score { font-size: 1.5rem; }
+  .matchup .side { gap: .5rem; }
+  .verdict .main { font-size: 1.15rem; }
+  .gcards { grid-template-columns: 1fr; }
+}
 
 /* sidebar */
 section[data-testid="stSidebar"] .brand { font-size: 1.1rem; font-weight: 700; letter-spacing: -.01em; }
@@ -250,3 +304,36 @@ def _table(head, rows, cls=''):
     body = ''.join('<tr>' + ''.join(f'<td class="{c}">{cell}</td>' for cell, (_, c) in zip(row, head)) + '</tr>'
                    for row in rows)
     show(f'<div class="tbl-wrap"><table class="{f"trk {cls}".strip()}"><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>')
+
+
+# ---------------------------------------------------------------------------
+# Kalshi bot
+# ---------------------------------------------------------------------------
+
+STATUS_TONES = {'Bet placed': 'pos', 'Waiting on injury news': 'warn', 'Flagged': 'neg', 'No edge': 'flat',
+                'Missed the cutoff': 'flat'}
+
+
+def status_tone(status):
+    return STATUS_TONES.get(status, 'accent' if status.startswith('Opens') else 'flat')
+
+
+def bot_bar(ok, parts):
+    """One-line bot status: a green/red dot and the parts (already escaped/markup) separated by dots."""
+    sep = '<span class="sep">·</span>'
+    show(f'<div class="botbar"><span class="dot{"" if ok else " off"}"></span>{sep.join(parts)}</div>')
+
+
+def game_cards(cards):
+    """Today's games as cards. cards: [{away, home, time, status, details, bets: [(desc, numbers)]}]."""
+    out = []
+    for c in cards:
+        tone = status_tone(c['status'])
+        bets = ''.join(f'<div class="bet"><span>{esc(d)}</span><span class="n">{esc(n)}</span></div>'
+                       for d, n in c['bets'])
+        details = f'<div class="details">{esc(c["details"])}</div>' if c['details'] else ''
+        out.append(f'<div class="gcard {tone}"><div class="top"><span class="time">{esc(c["time"])}</span>'
+                   f'{pill(c["status"], tone)}</div>'
+                   f'<div class="teams">{logo(c["away"], 30)}{esc(c["away"])}<span class="at">@</span>'
+                   f'{logo(c["home"], 30)}{esc(c["home"])}</div>{details}{bets}</div>')
+    show(f'<div class="gcards">{"".join(out)}</div>')

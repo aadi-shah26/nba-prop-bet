@@ -1215,6 +1215,7 @@ with tab_results:
 # ---------------------------------------------------------------------------
 
 KALSHI_CONFIG = {
+    'Tip-off': st.column_config.TextColumn(width="small", help="Game time, US Eastern"),
     'Price': st.column_config.NumberColumn(format="%.0f¢", help="Paid per contract; it pays $1 if it wins"),
     'Pays': st.column_config.NumberColumn(format="%.2fx", help="Payout multiplier: $1 / price"),
     'Qty': st.column_config.NumberColumn(help="Contracts bought"),
@@ -1231,6 +1232,37 @@ KALSHI_CONFIG = {
 }
 
 
+POS_COLOR, NEG_COLOR, MUTED_COLOR = '#22A55A', '#E05252', '#8A94A6'   # readable on light and dark
+
+
+def color_results(df):
+    """Green/red text for wins, losses and the sign of Profit, CLV and ROI; pending in grey. Looks only."""
+    def result(v):
+        return {'WIN': f'color: {POS_COLOR}; font-weight: 600', 'LOSS': f'color: {NEG_COLOR}; font-weight: 600',
+                'Pending': f'color: {MUTED_COLOR}'}.get(v, '')
+
+    def sign(v):
+        return '' if pd.isna(v) or v == 0 else f'color: {POS_COLOR if v > 0 else NEG_COLOR}'
+    styled = df.style
+    if 'Result' in df:
+        styled = styled.map(result, subset=['Result'])
+    signed = [c for c in ('Profit', 'CLV', 'ROI') if c in df]
+    return styled.map(sign, subset=signed) if signed else styled
+
+
+def bankroll_chart(curve, start):
+    """Paper bankroll by day: one line with points, a dashed rule at the starting bankroll."""
+    x = alt.X('Day:N', sort=None, title=None, axis=alt.Axis(labelAngle=0))
+    y = alt.Y('Bankroll:Q', scale=alt.Scale(zero=False, padding=12), axis=alt.Axis(format='$,.0f', grid=True),
+              title=None)
+    tip = [alt.Tooltip('Day:N'), alt.Tooltip('Bankroll:Q', format='$,.2f')]
+    line = alt.Chart(curve).mark_line(strokeWidth=2, color='#3B6FE0').encode(x=x, y=y)
+    dots = alt.Chart(curve).mark_point(filled=True, size=70, color='#3B6FE0').encode(x=x, y=y, tooltip=tip)
+    rule = alt.Chart(pd.DataFrame({'Bankroll': [start]})).mark_rule(strokeDash=[4, 4], color=MUTED_COLOR,
+                                                                     strokeWidth=1).encode(y='Bankroll:Q')
+    return (rule + line + dots).properties(height=220)
+
+
 def et_time(iso):
     t = pd.Timestamp(iso).tz_convert('America/New_York')
     return f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M} {'am' if t.hour < 12 else 'pm'} ET"
@@ -1244,27 +1276,31 @@ with tab_kalshi:
         show = st.session_state.get('kalshi_show') or 'Today'
         bets, days = kalshi_bot.paper_bets(conn, show), kalshi_bot.daily_summary(conn)
         flags, status = kalshi_bot.flagged(conn, kalshi_bot.et_today()), kalshi_bot.last_status(conn)
+        n_today, why_games = kalshi_bot.outlook(conn, kalshi_bot.et_today())
+        today_bets = kalshi_bot.paper_bets(conn, 'Today') if why_games else None
     finally:
         conn.close()
 
     c1, c2 = st.columns([4, 1], vertical_alignment="center")
     c1.caption("Paper trades only: no money moves. On game days, opening the app runs the bot by itself (at "
                "most every 15 minutes, until 30 minutes before the last tip-off). It bets each game only between 90 "
-               "and 30 minutes before its tip-off, and waits while a key player is listed Day-To-Day or "
-               "Questionable. It holds to the final score. Bets settle when the app pulls new games.")
+               "and 30 minutes before its tip-off, and waits while a key player is listed Questionable or "
+               "Doubtful. It holds to the final score. Bets settle when the app pulls new games.")
     running = background.status()['running']
     if c2.button("Run bot now", key="kalshi_run", icon=":material/play_arrow:", width="stretch", disabled=running,
                  help="Price today's Kalshi contracts and record any new paper bets"):
         start_background(update=False, kalshi=True)
         st.rerun()
     if status:
-        ui.show(f"{ui.pill('Last run ' + et_time(status[0]), 'flat')} &nbsp;{ui.esc(status[1])}")
+        ui.bot_bar(not status[1].startswith('no bets:'),
+                   [f"<b>Last run {ui.esc(et_time(status[0]))}</b>", ui.esc(status[1]),
+                    '<span class="muted">checks every 15 minutes</span>'])
     else:
-        ui.show(ui.pill('Not run yet', 'neg'))
+        ui.bot_bar(False, ['<b>Not run yet</b>'])
     if rep['bets'] == 0:
         st.info("No paper bets yet. Press **Run bot now**, or open the app on a game day.", icon=":material/info:")
     else:
-        c = st.columns([1.5, 0.8, 1, 1, 1])
+        c = st.columns([1.3, 0.8, 1, 1.3, 1])
         c[0].metric("Paper bankroll", f"${rep['bankroll']:,.0f}",
                     delta=f"{rep['bankroll'] - start:+,.2f}" if start and rep['settled'] else None,
                     help=f"Started at ${start:,.2f}; changes as bets settle")
@@ -1281,6 +1317,33 @@ with tab_kalshi:
                     f"<b>{rep['brier_model']:.4f}</b>, Kalshi <b>{rep['brier_kalshi']:.4f}</b> (lower is better)."
                     + (" <i>Too few to mean much yet.</i>" if rep['brier_n'] < 200 else ""))
 
+    if why_games:
+        now = pd.Timestamp.now(tz='UTC')
+
+        def card(g):
+            away, home = g['game'].split(' @ ')
+            tip = g['tip_utc']
+            mine = today_bets[today_bets['Game'] == g['game']]
+            return {'away': away, 'home': home, 'status': g['status'], 'details': g['details'],
+                    'time': (f"{kalshi_bot.et_clock(tip)} ET" + (" · started" if pd.Timestamp(tip) <= now else "")
+                             if tip else "Time TBD"),
+                    'bets': [(b['Bet'], f"{b['Qty']} @ {b['Price']:.0f}¢ · EV {b['EV']:+.1f}¢")
+                             for _, b in mine.iterrows()]}
+
+        st.subheader("Today's games")
+        st.caption(f"{n_today} paper bet{'s' * (n_today != 1)} so far. Where each game stands as of the last bot run "
+                   "(it checks every 15 minutes); times are ET.")
+        ui.game_cards([card(g) for g in why_games])
+
+    if rep['settled']:
+        hist = days.iloc[::-1]
+        curve = pd.DataFrame({'Day': ['Start'] + list(hist['Date']),
+                              'Bankroll': [start] + list(start + hist['Profit'].fillna(0).cumsum())})
+        with st.container(border=True):
+            ui.show('<div class="sec-title">Paper bankroll</div>'
+                    '<div class="sec-sub">After each day\'s settled bets</div>')
+            st.altair_chart(bankroll_chart(curve, start), width="stretch")
+
     if not flags.empty:
         st.subheader("Flagged today")
         st.caption("Model and Kalshi disagree too much to bet. Usually injury news the model hasn't seen.")
@@ -1293,7 +1356,7 @@ with tab_kalshi:
         if bets.empty:
             st.caption("No paper bets for today yet." if show == 'Today' else f"No {show.lower()} bets.")
         else:
-            st.dataframe(bets, hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
+            st.dataframe(color_results(bets), hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
         st.subheader("By day")
-        st.dataframe(days, hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
+        st.dataframe(color_results(days), hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
         st.caption("One night is noise. Judge the bot on CLV after a few hundred bets, not on the record.")

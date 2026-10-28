@@ -4,19 +4,34 @@ toolbarMode = "minimal"
 [browser]
 gatherUsageStats = false
 
+# No fixed base: the app follows the computer's light/dark setting (ui.py's CSS does the same)
 [theme]
-base = "light"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+baseRadius = "0.5rem"
+showWidgetBorder = true
+
+[theme.light]
 primaryColor = "#1D4ED8"
 backgroundColor = "#F6F7F9"
 secondaryBackgroundColor = "#EEF1F5"
 textColor = "#0F172A"
 borderColor = "#E2E8F0"
-font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
-baseRadius = "0.5rem"
-showWidgetBorder = true
 
-[theme.sidebar]
+[theme.light.sidebar]
 backgroundColor = "#0F172A"
 secondaryBackgroundColor = "#1E293B"
 textColor = "#E2E8F0"
 borderColor = "#334155"
+
+[theme.dark]
+primaryColor = "#7AA2FF"
+backgroundColor = "#0B0F17"
+secondaryBackgroundColor = "#1A2130"
+textColor = "#E2E8F0"
+borderColor = "#263142"
+
+[theme.dark.sidebar]
+backgroundColor = "#070A10"
+secondaryBackgroundColor = "#141A25"
+textColor = "#E2E8F0"
+borderColor = "#263142"

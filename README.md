@@ -229,9 +229,9 @@ How a contract is judged (all thresholds are flags, e.g. `--min-ev 0.03`, `--ble
 * **When:** each game only between 90 and 30 minutes before its tip-off (`--window-minutes`),
   when most injury news is out. Earlier runs still record prices, and print when betting opens.
 * **Unsettled injuries:** a game waits ("waiting on injury news") while a player who would be in
-  either team's top-8 lineup is on ESPN's report as anything but Out (Day-To-Day, Questionable).
-  The model would assume he plays. `--bet-through-injuries` bets anyway. If ESPN leaves a player
-  listed after he's cleared, the game is never bet that night.
+  either team's top-8 lineup is on ESPN's report as Questionable or Doubtful. The model would
+  assume he plays. `--bet-through-injuries` bets anyway. Day-To-Day doesn't hold a game: ESPN
+  rarely updates it before tip-off, so waiting on it skipped most games with an edge.
 * **Skipped:** bid-ask spreads wider than 4¢, prices under 5¢ or over 95¢, games within 30 minutes
   of tip-off, and gaps of more than 15 points between model and Kalshi. Those are flagged in the
   output to check the news, not bet.
