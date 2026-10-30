@@ -217,3 +217,29 @@ CREATE TABLE IF NOT EXISTS kalshi_snapshots (
     result      INTEGER                  -- 1 = YES won
 );
 CREATE INDEX IF NOT EXISTS idx_kalshi_snap_date ON kalshi_snapshots(game_date);
+
+-- Kalshi's past NBA contracts (kalshi_history.py) for backtesting the model against real prices:
+-- the bid/ask an hour before tip-off (when the bot bets) and at tip-off (the closing price).
+CREATE TABLE IF NOT EXISTS kalshi_history (
+    ticker      TEXT PRIMARY KEY,
+    game_date   TEXT NOT NULL,
+    home        TEXT NOT NULL,
+    away        TEXT NOT NULL,
+    tip_utc     TEXT NOT NULL,
+    market      TEXT NOT NULL,           -- 'WINNER' | 'SPREAD' | 'TOTAL'
+    team        TEXT,
+    line        REAL,
+    bet_bid     REAL,                    -- yes bid/ask at the hourly close 60 minutes before tip-off
+    bet_ask     REAL,
+    close_bid   REAL,                    -- ... and at tip-off
+    close_ask   REAL,
+    volume      REAL,
+    result      INTEGER NOT NULL,        -- 1 = YES won
+    fetched_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kalshi_hist_date ON kalshi_history(game_date);
+-- Games kalshi_history.py has finished (so a rerun skips them, even ones with no usable prices)
+CREATE TABLE IF NOT EXISTS kalshi_history_games (
+    event       TEXT PRIMARY KEY,        -- e.g. 26MAR31DALMIL
+    fetched_at  TEXT NOT NULL
+);

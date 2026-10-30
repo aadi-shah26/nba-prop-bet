@@ -110,8 +110,9 @@ def match_game(game_date, codes, games):
 
 def _strike(m, suffix_number):
     """The line a SPREAD/TOTAL contract is over ("wins by over 6.5" -> 6.5). Kalshi's
-    floor_strike when it's sent, else the ticker's number - 0.5 (CHA7 = over 6.5). None when the
-    two disagree or the contract isn't an "over" (fail closed rather than guess)."""
+    floor_strike when it's sent, else the ticker's number - 0.5 (CHA7 = over 6.5). Tickers from
+    2025-26 used the number below instead (DET9 = over 9.5), which floor_strike confirms. None when
+    the two disagree or the contract isn't an "over" (fail closed rather than guess)."""
     fs = _num(m.get('floor_strike'))
     st = m.get('strike_type')
     if st not in (None, '', 'greater', 'greater_or_equal'):
@@ -121,16 +122,17 @@ def _strike(m, suffix_number):
     from_ticker = None if suffix_number is None else suffix_number - 0.5
     if fs is None:
         return from_ticker
-    if from_ticker is not None and fs not in (from_ticker, suffix_number):
+    if from_ticker is not None and fs not in (from_ticker, suffix_number, suffix_number + 0.5):
         return None
     return fs
 
 
-def parse_market(kind, m, game):
+def parse_market(kind, m, game, settled=False):
     """One Kalshi market -> a flat contract dict for `game`, or None if it can't be read safely.
     team: the team the YES side backs (WINNER/SPREAD); line: what it must win by / the total
-    must exceed (SPREAD/TOTAL). yes_ask/no_ask are what buying each side costs right now."""
-    if m.get('status') not in (None, 'active', 'open'):      # closed, settled, not yet trading
+    must exceed (SPREAD/TOTAL). yes_ask/no_ask are what buying each side costs right now.
+    settled=True also reads finished markets (for the history backtest)."""
+    if not settled and m.get('status') not in (None, 'active', 'open'):   # closed, settled, not yet trading
         return None
     suffix = (m.get('ticker') or '').rsplit('-', 1)[-1]
     sm = re.fullmatch(r'([A-Z]*)(\d*)', suffix)

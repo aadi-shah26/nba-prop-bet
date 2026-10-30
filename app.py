@@ -1274,7 +1274,10 @@ with tab_kalshi:
         rep = kalshi_bot.report(conn)
         start = float(get_meta(conn, kalshi_bot.BANKROLL_KEY) or 0)
         show = st.session_state.get('kalshi_show') or 'Today'
-        bets, days = kalshi_bot.paper_bets(conn, show), kalshi_bot.daily_summary(conn)
+        bet_days = kalshi_bot.bet_days(conn)
+        day = st.session_state.get('kalshi_day') if show != 'Today' else None
+        day = day if day in bet_days else None
+        bets, days = kalshi_bot.paper_bets(conn, show, day), kalshi_bot.daily_summary(conn)
         flags, status = kalshi_bot.flagged(conn, kalshi_bot.et_today()), kalshi_bot.last_status(conn)
         n_today, why_games = kalshi_bot.outlook(conn, kalshi_bot.et_today())
         today_bets = kalshi_bot.paper_bets(conn, 'Today') if why_games else None
@@ -1351,10 +1354,15 @@ with tab_kalshi:
 
     if rep['bets']:
         st.subheader("Paper bets")
-        st.segmented_control("Show", ["Today", "Pending", "Finished", "All"], default="Today", key="kalshi_show",
+        c1, c2 = st.columns([3, 1], vertical_alignment="center")
+        c1.segmented_control("Show", ["Today", "Pending", "Finished", "All"], default="Today", key="kalshi_show",
                              label_visibility="collapsed")
+        if show != 'Today':
+            c2.selectbox("Day", [None] + bet_days, key="kalshi_day", label_visibility="collapsed",
+                         format_func=lambda d: "All days" if d is None else f"{pd.Timestamp(d):%a, %b %-d}")
         if bets.empty:
-            st.caption("No paper bets for today yet." if show == 'Today' else f"No {show.lower()} bets.")
+            st.caption("No paper bets for today yet." if show == 'Today' else
+                       f"No {show.lower()} bets{f' on {pd.Timestamp(day):%b %-d}' if day else ''}.")
         else:
             st.dataframe(color_results(bets), hide_index=True, column_config=KALSHI_CONFIG, placeholder="–")
         st.subheader("By day")

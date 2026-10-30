@@ -474,14 +474,18 @@ def report(conn):
     return out
 
 
-def paper_bets(conn, show='All'):
-    """Paper bets for display, newest first. show: 'Today' | 'Pending' | 'Finished' | 'All'. CLV (cents per
-    contract) is our side's last pre-tip mid minus what we paid, once the game has tipped off."""
+def paper_bets(conn, show='All', day=None):
+    """Paper bets for display, newest first. show: 'Today' | 'Pending' | 'Finished' | 'All'; day (ISO game
+    date) narrows that to one day. CLV (cents per contract) is our side's last pre-tip mid minus what we paid,
+    once the game has tipped off."""
     where = {'Pending': ' AND o.result IS NULL', 'Finished': ' AND o.result IS NOT NULL',
              'Today': f" AND o.game_date = '{et_today()}'"}.get(show, '')
+    params = (MODE,)
+    if day:
+        where, params = where + ' AND o.game_date = ?', (MODE, day)
     o = pd.read_sql_query(
         "SELECT o.*, s.last_mid FROM kalshi_orders o LEFT JOIN kalshi_snapshots s ON s.ticker = o.ticker "
-        f"WHERE o.mode = ?{where} ORDER BY o.game_date DESC, o.tip_utc, o.id", conn, params=(MODE,))
+        f"WHERE o.mode = ?{where} ORDER BY o.game_date DESC, o.tip_utc, o.id", conn, params=params)
     close = o['last_mid'].where(o['side'] == 'yes', 1 - o['last_mid'])
     started = pd.to_datetime(o['tip_utc'], utc=True) <= now_utc()
     return pd.DataFrame({
@@ -493,6 +497,12 @@ def paper_bets(conn, show='All'):
         'CLV': ((close - o['price']) * 100).where(started),
         'Result': o['result'].fillna('Pending'), 'Profit': o['profit'],
     })
+
+
+def bet_days(conn):
+    """ISO game dates the bot has paper bets on, newest first."""
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT game_date FROM kalshi_orders WHERE mode = ? ORDER BY game_date DESC", (MODE,))]
 
 
 def daily_summary(conn):

@@ -1,0 +1,19 @@
+1310 games with a Kalshi line
+
+Margin: actual - Kalshi line, on what the model knows (t above ~2 would matter)
+                   coef      t
+const            -0.195 -0.500
+gap_margin       -0.008 -0.048
+gap_margin_early -0.220 -0.566
+b2b_diff         -0.390 -0.315
+lineup_diff       0.020  0.701
+rest_diff        -0.351 -0.512
+t34_diff          0.827  1.058 
+
+Total: actual - Kalshi line
+                  coef      t
+const            0.241  0.397
+gap_total       -0.138 -1.036
+gap_total_early -0.528 -1.832
+lin_sum         -0.050 -1.568
+b2b_sum          0.238  0.268

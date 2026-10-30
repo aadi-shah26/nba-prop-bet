@@ -88,6 +88,13 @@ def test_parse_market_fails_closed():
     assert contract('WINNER', 'KXNBAGAME-26OCT26WASCHA-CHA', 0.5, 0.52, status='closed') is None
 
 
+def test_parse_settled_market_with_last_seasons_ticker_numbers():
+    # 2025-26 tickers named the strike below the line: DET9 = over 9.5 (floor_strike confirms it)
+    m = mkt('KXNBASPREAD-26OCT26WASCHA-CHA9', 0.5, 0.52, status='finalized', floor_strike=9.5, strike_type='greater')
+    assert parse_market('SPREAD', m, GAME) is None                       # live parsing skips finished markets
+    assert parse_market('SPREAD', m, GAME, settled=True)['line'] == 9.5
+
+
 def test_parse_market_reads_cents_and_derives_the_no_side():
     m = {'ticker': 'KXNBAGAME-26OCT26WASCHA-CHA', 'status': 'active', 'yes_bid': 57, 'yes_ask': 58}
     c = parse_market('WINNER', m, GAME)
@@ -505,6 +512,9 @@ def test_summary_helpers(conn, monkeypatch):
     assert list(b['Tip-off']) == ['7:00 pm']
     assert b['Pays'].iloc[0] == pytest.approx(1 / 0.60)
     assert kalshi_bot.paper_bets(conn, 'Finished').empty
+    assert kalshi_bot.bet_days(conn) == ['2026-10-26']
+    assert len(kalshi_bot.paper_bets(conn, 'All', '2026-10-26')) == 1
+    assert kalshi_bot.paper_bets(conn, 'All', '2026-10-25').empty
     add_final(conn, 110, 100)
     settle(conn)
     d = kalshi_bot.daily_summary(conn)

@@ -255,7 +255,16 @@ requirements, since cron's PATH is minimal):
 
 **The app runs it for you:** on a game day, opening the app runs the bot in the background
 (after pulling new games, at most every 15 minutes, until 30 minutes before the last tip-off),
-and the tab has a **Run bot now** button. `NBA_KALSHI_AUTO=0` turns the automatic run off. Cron
+and the tab has a **Run bot now** button. `NBA_KALSHI_AUTO=0` turns the automatic run off.
+
+Against Kalshi's real prices for the whole 2025-26 season the model added nothing beyond Kalshi's
+price, and these rules lost 8% over 1,011 bets (`research/kalshi_2025_26/REPORT.md`), so treat
+the paper record as a live check, not a strategy.
+
+**Backtest against Kalshi:** `python kalshi_history.py` downloads a past season's settled Kalshi
+contracts (price an hour before tip-off and at tip-off; about two hours, resumable), then
+`python market_backtest.py` scores the model against them walk-forward and simulates the bot's
+rules (`--blend`, `--max-disagree`, `--one-per-game`). Cron
 is what bets each game inside its window and catches late price moves (for CLV) when the app
 isn't open.
 
@@ -270,6 +279,8 @@ for real money is 300+ paper bets with positive average CLV.
 | File | Purpose |
 |---|---|
 | `app.py`, `start.command` | The web app and its Mac launcher |
+| `kalshi_history.py` | Downloads a past season's settled Kalshi NBA contracts into `kalshi_history` |
+| `market_backtest.py` | Walk-forward test of the model against Kalshi's real prices |
 | `fetch_game_logs.py` | League-wide player + team game logs from stats.nba.com |
 | `daily_update.py` | Refresh current season, settle logged bets and Kalshi paper bets, recalibrate game model, refresh schedule |
 | `nba_injuries.py` | Today's injury report (ESPN), used for the playing/out defaults (`NBA_INJURIES=0` turns it off) |

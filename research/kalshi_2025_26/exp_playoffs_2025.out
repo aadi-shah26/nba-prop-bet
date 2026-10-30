@@ -1,0 +1,6 @@
+market  contracts  games  brier_kalshi  brier_model  brier_blend  model_weight  best_blend
+WINNER        160     80        0.2305       0.2366       0.2313       -0.5438        0.15
+   ALL        160     80        0.2305       0.2366       0.2313       -0.5438        0.15
+market  bets  win%  ROI%  ROI 90% lo  ROI 90% hi  CLV¢  avg EV¢
+WINNER    20  35.0  6.43       -47.7       64.98 -0.33     3.53
+   ALL    20  35.0  6.43       -47.7       64.98 -0.33     3.53
